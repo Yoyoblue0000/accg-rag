@@ -15,6 +15,11 @@ def analyze(project_path: str, qa_path: str, limit: int = 10):
     gt.embedding_ranker = EmbeddingRanker()
     print("构建图中...", flush=True)
     print(gt.ensure_built(), flush=True)
+    try:
+        gt.embedding_ranker.build_index(gt._graph)
+    except Exception as e:
+        print(f"Embedding 索引构建失败: {e}", file=sys.stderr)
+        return
 
     print(f"\n{'='*80}")
     print(f"Embedding 候选与 QA 问题相关性分析 (前 {limit} 题)")

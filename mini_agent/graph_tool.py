@@ -5,9 +5,17 @@ import json
 import logging
 import pickle
 import re
+import time
 from pathlib import Path
 
 from accg.models import NodeId, EdgeType
+from .retrieval import (
+    Candidate,
+    CandidateRetriever,
+    RetrievalResult,
+    build_entries,
+    select_query_anchors as _select_query_anchors,
+)
 
 logger = logging.getLogger("mini_agent.graph_tool")
 
@@ -31,39 +39,71 @@ def _build_embed_text(node: dict) -> str:
     doc = node.get("docstring", "")
     if doc and len(doc) < 300:
         parts.append(doc)
-    path = node.get("file_path", "")
+    path = node.get("file", "")
     if path:
         parts.append(" ".join(_split_camel(p) for p in path.replace("/", " ").replace("_", " ").split()))
+    parent = node.get("parent", "")
+    if parent:
+        parts.append(_split_camel(parent))
+    decorators = node.get("decorators", [])
+    if decorators:
+        parts.append(" ".join(_split_camel(str(item)) for item in decorators))
     return " ".join(parts)
 
 
 class EmbeddingRanker:
     """基于 Ollama embedding 的语义候选排序器，带磁盘缓存"""
 
-    _CACHE_VERSION = 1
+    _CACHE_VERSION = 2
 
-    def __init__(self, base_url: str = "http://localhost:11434/v1", cache_dir: str | None = None):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434/v1",
+        cache_dir: str | None = None,
+        timeout: float = 3.0,
+    ):
         self._client = None
         self._base_url = base_url
         self._model = "nomic-embed-text"
         self._embeddings: list[tuple[dict, list[float]]] | None = None  # [(node, vec)]
         self._cache_dir = Path(cache_dir) if cache_dir else None
+        self._timeout = timeout
+        self._failed_reason: str | None = None
 
     def _ensure_client(self) -> bool:
+        if self._failed_reason is not None:
+            return False
         if self._client is not None:
             return True
         try:
             from openai import OpenAI
-            self._client = OpenAI(base_url=self._base_url, api_key="ollama")
+            self._client = OpenAI(
+                base_url=self._base_url,
+                api_key="ollama",
+                timeout=self._timeout,
+                max_retries=0,
+            )
             return True
         except Exception as e:
-            logger.warning("EmbeddingRanker: 无法连接 Ollama (%s)", e)
+            self._failed_reason = str(e)
+            logger.warning("EmbeddingRanker: 无法初始化客户端 (%s)", e)
             return False
 
     def _fingerprint(self, entries: list[dict]) -> str:
         """基于符号列表生成指纹，代码变化则指纹变化"""
         raw = json.dumps(
-            [(e["id"], e["name"], e.get("signature", ""), e.get("docstring", "")) for e in entries],
+            [
+                (
+                    e["id"],
+                    e["name"],
+                    e.get("file", ""),
+                    e.get("signature", ""),
+                    e.get("docstring", ""),
+                    e.get("parent", ""),
+                    e.get("decorators", []),
+                )
+                for e in entries
+            ],
             sort_keys=True, ensure_ascii=False,
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -75,8 +115,10 @@ class EmbeddingRanker:
 
     def build_index(self, graph) -> None:
         """预计算全图节点的 embedding（批量），优先从磁盘缓存加载"""
-        if not self._ensure_client():
+        if self._embeddings is not None:
             return
+        if not self._ensure_client():
+            raise RuntimeError(self._failed_reason or "embedding 客户端不可用")
 
         # 收集符号条目
         entries = []
@@ -93,6 +135,9 @@ class EmbeddingRanker:
             file_path = str(ndata.get("file_path", ""))
             if file_path.startswith("tests/") or "test" in file_path.lower().split("/"):
                 continue
+            extra = ndata.get("extra") or {}
+            decorators = ndata.get("decorators") or extra.get("decorators") or []
+            parent_id = str(ndata.get("parent_id") or "")
             node = {
                 "id": nid,
                 "name": name,
@@ -100,6 +145,8 @@ class EmbeddingRanker:
                 "file": file_path,
                 "signature": str(ndata.get("signature", "")),
                 "docstring": str(ndata.get("docstring", "")),
+                "parent": parent_id.rsplit("::", 1)[-1] if parent_id else "",
+                "decorators": decorators,
             }
             entries.append(node)
             texts.append(_build_embed_text(node))
@@ -125,7 +172,11 @@ class EmbeddingRanker:
         all_vecs = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            resp = self._client.embeddings.create(model=self._model, input=batch)
+            try:
+                resp = self._client.embeddings.create(model=self._model, input=batch)
+            except Exception as e:
+                self._failed_reason = str(e)
+                raise
             for d in resp.data:
                 all_vecs.append(d.embedding)
 
@@ -149,8 +200,13 @@ class EmbeddingRanker:
         """返回按嵌入相似度排序的候选列表"""
         if not self._embeddings:
             return []
-        self._ensure_client()
-        resp = self._client.embeddings.create(model=self._model, input=[query])
+        if not self._ensure_client():
+            raise RuntimeError(self._failed_reason or "embedding 客户端不可用")
+        try:
+            resp = self._client.embeddings.create(model=self._model, input=[query])
+        except Exception as e:
+            self._failed_reason = str(e)
+            raise
         q_vec = resp.data[0].embedding
 
         scored = []
@@ -158,20 +214,23 @@ class EmbeddingRanker:
             sim = sum(a * b for a, b in zip(q_vec, n_vec))
             scored.append({**node, "score": round(sim, 4)})
 
-        scored.sort(key=lambda x: -x["score"])
+        scored.sort(key=lambda x: (-x["score"], x["id"]))
         return scored[:limit]
 
 
 class GraphTool:
     """加载 ACCG 图并提供结构化查询。"""
 
-    def __init__(self, project_path: str):
+    def __init__(self, project_path: str, enable_embeddings: bool = False):
         self.project_path = Path(project_path)
+        self.enable_embeddings = enable_embeddings
         self._graph = None
         self._query = None
         self._built = False
         self._graph_names_cache: dict[str, list[dict]] = {}
         self.embedding_ranker: EmbeddingRanker | None = None
+        self._candidate_retriever: CandidateRetriever | None = None
+        self._embedding_failed_reason: str | None = None
 
     def ensure_built(self) -> str:
         if self._built:
@@ -182,12 +241,9 @@ class GraphTool:
         self._graph = builder.build(str(self.project_path))
         self._query = GraphQuery(self._graph)
         self._built = True
+        self._candidate_retriever = None
         node_count = self._graph.number_of_nodes()
         edge_count = self._graph.number_of_edges()
-
-        # 构建 embedding 索引
-        if self.embedding_ranker is not None:
-            self.embedding_ranker.build_index(self._graph)
 
         return f"图构建完成: {node_count} 个节点, {edge_count} 条边"
 
@@ -505,20 +561,113 @@ class GraphTool:
             for caller_info, caller_edge in callers[:8]
         ]
 
-    # ── 候选排序（embedding） ──────────────────────────
+    # ── 候选检索 ───────────────────────────────────────
 
     def rank_candidates(self, text: str, limit: int = 12) -> list[dict]:
-        """用 embedding 语义匹配排序候选符号"""
-        self._ensure_embedding_ranker()
-        if self.embedding_ranker is None:
-            return []
-        return self.embedding_ranker.rank(text, limit=limit)
+        """兼容旧接口，返回包含 embedding 增强的候选字典。"""
+        result = self.retrieve_query_candidates(
+            text,
+            limit=limit,
+            use_embeddings=self.enable_embeddings,
+        )
+        return [candidate.to_dict() for candidate in result.candidates]
+
+    def rank_query_candidates(self, text: str, limit: int = 12) -> list[dict]:
+        """返回确定性的精确、词法与模糊候选。"""
+        result = self.retrieve_query_candidates(
+            text,
+            limit=limit,
+            use_embeddings=False,
+        )
+        return [candidate.to_dict() for candidate in result.candidates]
+
+    def retrieve_query_candidates(
+        self,
+        text: str,
+        limit: int = 12,
+        use_embeddings: bool = True,
+    ) -> RetrievalResult:
+        """执行候选检索；embedding 失败时保留确定性结果。"""
+        started_at = time.perf_counter()
+        if not self._built or self._graph is None:
+            return RetrievalResult(
+                candidates=[],
+                stages_attempted=[],
+                stages_succeeded=[],
+                diagnostics=["图尚未构建"],
+                status="failed",
+                duration_ms=(time.perf_counter() - started_at) * 1000,
+            )
+        if self._candidate_retriever is None:
+            self._candidate_retriever = CandidateRetriever(
+                build_entries(self._graph)
+            )
+
+        embedding_candidates = None
+        embedding_error = None
+        embedding_attempted = False
+        if use_embeddings:
+            embedding_attempted = True
+            if self._embedding_failed_reason is not None:
+                embedding_error = self._embedding_failed_reason
+            else:
+                try:
+                    self._ensure_embedding_ranker()
+                    self.embedding_ranker.build_index(self._graph)
+                    embedding_candidates = self.embedding_ranker.rank(
+                        text,
+                        limit=limit,
+                    )
+                except Exception as e:
+                    embedding_error = str(e)
+                    self._embedding_failed_reason = embedding_error
+                    logger.warning(
+                        "候选检索跳过 embedding，使用确定性回退: %s",
+                        embedding_error,
+                    )
+
+        result = self._candidate_retriever.retrieve(
+            text,
+            limit=limit,
+            embedding_candidates=embedding_candidates,
+            embedding_attempted=embedding_attempted,
+            embedding_error=embedding_error,
+        )
+        result.duration_ms = (time.perf_counter() - started_at) * 1000
+        return result
+
+    def select_query_anchors(
+        self,
+        query: str,
+        candidates: list[dict],
+        max_anchors: int = 3,
+    ) -> list[dict]:
+        """从已排序候选中确定性地选择类型多样的锚点。"""
+        del query
+        typed_candidates = []
+        for item in candidates:
+            typed_candidates.append(Candidate(
+                id=item.get("id", ""),
+                name=item.get("name", ""),
+                type=item.get("type", ""),
+                file=item.get("file", ""),
+                score=float(item.get("score", 0.0)),
+                sources=list(item.get("sources", [])),
+                matched_terms=list(item.get("matched_terms", [])),
+                matched_fields=list(item.get("matched_fields", [])),
+            ))
+        return [
+            candidate.to_dict()
+            for candidate in _select_query_anchors(
+                typed_candidates,
+                max_anchors=max_anchors,
+            )
+        ]
 
     def _ensure_embedding_ranker(self):
-        if self.embedding_ranker is None and self._built:
+        if self.embedding_ranker is None:
             cache_dir = str(self.project_path / ".accg")
             self.embedding_ranker = EmbeddingRanker(cache_dir=cache_dir)
-            self.embedding_ranker.build_index(self._graph)
 
     # ── extract_clues（独立工具） ────────────────────────
 

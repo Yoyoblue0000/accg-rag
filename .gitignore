@@ -16,6 +16,7 @@ build/
 .claude/
 
 # 第三方测试仓库（通过脚本克隆）
+test_repos/
 test_repos/requests_repo/
 test_repos/sqlfluff_repo/
 

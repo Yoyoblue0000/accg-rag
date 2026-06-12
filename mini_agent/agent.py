@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from .model import Model
 from .environment import Environment
+from .retrieval import RetrievalResult
 from accg.models import NodeId
 
 
@@ -35,6 +36,7 @@ class RunResult:
     answer: str
     error: str | None = None
     anchor_candidates: list[dict] = field(default_factory=list)
+    retrieval: RetrievalResult | None = None
     messages: list[MsgRecord] = field(default_factory=list)
     synthesis: SynthesisRecord | None = None
 
@@ -191,6 +193,7 @@ class Agent:
         self.answer_model = answer_model or model
         self.on_step = on_step
         self._trace: list[MsgRecord] = []
+        self._retrieval_result: RetrievalResult | None = None
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -200,6 +203,7 @@ class Agent:
     def run(self, task: str) -> RunResult:
         """执行任务,返回包含完整轨迹的 RunResult"""
         self._trace = []
+        self._retrieval_result = None
         graph_status = ""
         if self.graph_tool:
             try:
@@ -209,15 +213,42 @@ class Agent:
             if not self.graph_tool.is_ready:
                 return RunResult(answer="", error="图工具未就绪")
 
-        # 预分析：embedding 候选排序
+        # 预分析：确定性检索 + 可选 embedding 增强
         prelude = ""
         candidates = []
         if self.graph_tool:
-            candidates = self.graph_tool.rank_candidates(task, limit=8)
+            try:
+                self._retrieval_result = (
+                    self.graph_tool.retrieve_query_candidates(
+                        task,
+                        limit=8,
+                        use_embeddings=getattr(
+                            self.graph_tool,
+                            "enable_embeddings",
+                            False,
+                        ),
+                    )
+                )
+                candidates = [
+                    candidate.to_dict()
+                    for candidate in self._retrieval_result.candidates
+                ]
+            except Exception as e:
+                self._retrieval_result = RetrievalResult(
+                    candidates=[],
+                    stages_attempted=[],
+                    stages_succeeded=[],
+                    diagnostics=[f"候选检索失败: {e}"],
+                    status="failed",
+                )
             if candidates:
                 items = []
                 for c in candidates:
-                    items.append(f"  - {c['name']} ({c['type']}) {c['id']} [sim={c['score']:.2f}]")
+                    sources = ",".join(c.get("sources", []))
+                    items.append(
+                        f"  - {c['name']} ({c['type']}) {c['id']} "
+                        f"[score={c['score']:.2f}; sources={sources}]"
+                    )
                 prelude = "\n\n[候选符号] 以下与问题语义最相关:\n" + "\n".join(items)
 
         system_content = SYSTEM_PROMPT.replace("__CWD__", self.env.config.cwd).replace("__GRAPH_STATUS__", graph_status)
@@ -255,7 +286,12 @@ class Agent:
                 # 有证据 → 合成；无证据 → 直接用 FINAL 文本
                 if self._evidence:
                     return self._synthesize(task, candidates)
-                return RunResult(answer=final_text, anchor_candidates=candidates, messages=list(self._trace))
+                return RunResult(
+                    answer=final_text,
+                    anchor_candidates=candidates,
+                    retrieval=self._retrieval_result,
+                    messages=list(self._trace),
+                )
 
             # API 原生停牌信号（借鉴 OpenCode：finish_reason="stop" 即模型完成）
             if finish_reason == "stop" and not response["tool_calls"]:
@@ -265,8 +301,18 @@ class Agent:
                 if self._evidence:
                     return self._synthesize(task, candidates)
                 if thought:
-                    return RunResult(answer=thought, anchor_candidates=candidates, messages=list(self._trace))
-                return RunResult(answer="[模型未生成有效输出]", anchor_candidates=candidates, messages=list(self._trace))
+                    return RunResult(
+                        answer=thought,
+                        anchor_candidates=candidates,
+                        retrieval=self._retrieval_result,
+                        messages=list(self._trace),
+                    )
+                return RunResult(
+                    answer="[模型未生成有效输出]",
+                    anchor_candidates=candidates,
+                    retrieval=self._retrieval_result,
+                    messages=list(self._trace),
+                )
 
             # 无工具调用（finish_reason 可能为 "length" / None）
             if not response["tool_calls"]:
@@ -274,7 +320,12 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": thought})
                 if self._evidence:
                     return self._synthesize(task, candidates)
-                return RunResult(answer=thought, anchor_candidates=candidates, messages=list(self._trace))
+                return RunResult(
+                    answer=thought,
+                    anchor_candidates=candidates,
+                    retrieval=self._retrieval_result,
+                    messages=list(self._trace),
+                )
 
             # 有工具调用
             self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
@@ -347,7 +398,12 @@ class Agent:
                     "tool_call_id": tc["id"],
                 })
 
-        return RunResult(answer="[达到最大步数]", anchor_candidates=candidates, messages=list(self._trace))
+        return RunResult(
+            answer="[达到最大步数]",
+            anchor_candidates=candidates,
+            retrieval=self._retrieval_result,
+            messages=list(self._trace),
+        )
 
     @staticmethod
     def _check_convergence(raw_json: str) -> str | None:
@@ -391,7 +447,9 @@ class Agent:
         """将收集到的证据交给独立 prompt 合成最终答案"""
         if not self._evidence:
             return RunResult(answer="", error="未收集到任何证据",
-                             anchor_candidates=candidates, messages=list(self._trace))
+                             anchor_candidates=candidates,
+                             retrieval=self._retrieval_result,
+                             messages=list(self._trace))
 
         # 裁剪证据：每段最多 1500 字符，总共最多 6 段
         trimmed = []
@@ -412,6 +470,7 @@ class Agent:
         return RunResult(
             answer=answer,
             anchor_candidates=candidates,
+            retrieval=self._retrieval_result,
             messages=list(self._trace),
             synthesis=SynthesisRecord(prompt=prompt, answer=answer),
         )

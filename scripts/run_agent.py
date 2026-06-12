@@ -14,6 +14,10 @@ def main():
     base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/v1")
     model_name = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:14b-instruct")
     project_path = os.environ.get("PROJECT_PATH", str(Path(__file__).resolve().parent.parent))
+    enable_embeddings = os.environ.get(
+        "ACCG_ENABLE_EMBEDDINGS",
+        "",
+    ).lower() in {"1", "true", "yes", "on"}
 
     model = Model(ModelConfig(
         base_url=base_url,
@@ -36,7 +40,10 @@ def main():
             print(f"\n[Step {m.step}] {m.tool_name}{tag}")
             print(m.content)
 
-    graph_tool = GraphTool(project_path)
+    graph_tool = GraphTool(
+        project_path,
+        enable_embeddings=enable_embeddings,
+    )
     agent = Agent(model, env, graph_tool=graph_tool, max_steps=15, on_step=_on_step)
 
     if len(sys.argv) > 1:

@@ -26,7 +26,26 @@ cd accg-rag && uv venv && uv pip install -e .
   --qa-path /path/to/questions.json \
   --model qwen2.5-coder:14b-instruct \
   --limit 20
+
+# 仅运行确定性候选检索基线
+.venv/Scripts/python.exe scripts/run_qa.py \
+  --project-path /path/to/repo \
+  --qa-path /path/to/questions.json \
+  --retrieval-only --limit 20
+
+# 检索基线 + embedding 增强
+.venv/Scripts/python.exe scripts/run_qa.py \
+  --project-path /path/to/repo \
+  --qa-path /path/to/questions.json \
+  --retrieval-only --embedding --limit 20
 ```
+
+QA 结果保留完整参考答案、候选排名、检索阶段和降级原因，并生成
+`*.summary.json` 汇总 Recall@1/3/5/10、MRR、NDCG 和 fallback 计数。
+当前 gold 由参考答案中的 Python 路径、反引号符号和限定名启发式提取；
+NDCG 使用候选文档是否命中任一 gold 的二元相关性，后续可替换为人工标签。
+Embedding 默认关闭；可用 `--embedding` 或单任务环境变量
+`ACCG_ENABLE_EMBEDDINGS=1` 显式启用。
 
 ## 架构
 
@@ -34,7 +53,9 @@ cd accg-rag && uv venv && uv pip install -e .
 mini_agent/
   agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT、收敛分析
   model.py        — LLM 接口：流式调用 + THOUGHT/ACTION 解析
-  graph_tool.py   — 图查询工具：9 种 action + EmbeddingRanker
+  graph_tool.py   — 图查询工具：9 种 action + 可选 EmbeddingRanker
+  retrieval.py    — 精确/BM25/embedding/模糊候选检索级联
+  retrieval_metrics.py — 临时 gold 抽取与检索指标
   environment.py  — 只读文件工具
 scripts/
   run_agent.py    — 单任务入口
