@@ -1,0 +1,16 @@
+[project]
+name = "accg-rag"
+version = "0.1.0"
+description = "ACCG RAG Agent: 基于代码图的 ReAct 检索增强代码问答系统"
+requires-python = ">=3.11"
+dependencies = [
+    "accg",
+    "networkx>=3.0",
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.uv]
+dev-dependencies = ["pytest>=8.0"]

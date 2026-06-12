@@ -1,0 +1,46 @@
+# Python 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code 本地配置
+.claude/
+
+# 第三方测试仓库（通过脚本克隆）
+test_repos/requests_repo/
+test_repos/sqlfluff_repo/
+
+# 测试仓库（通过脚本克隆）
+tests/fixtures/
+
+# pyvis 生成的第三方库
+lib/
+
+# ACCG 运行时缓存
+.accg/
+.tmp/
+output/
+.scratch_*.txt
+sweqa_results*.json
+
+# Agent skills
+.agents/
+skills-lock.json
+
+# 论文资料
+tog2_paper.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db
+sqlfluff_*
+test_repos/sqlfluff_*
