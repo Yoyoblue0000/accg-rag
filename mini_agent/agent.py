@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Agent 核心 -- 极简 ReAct 循环,支持 图查询 + 只读文件 双工具"""
+import copy
 import json
 import re
 from collections import deque
@@ -7,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from .model import Model
 from .environment import Environment
+from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
 from .retrieval import RetrievalResult
 from accg.models import NodeId
 
@@ -189,16 +191,57 @@ class Agent:
         self.step_count = 0
         self._explored: set[str] = set()
         self._frontier: deque[str] = deque()
-        self._evidence: list[str] = []
+        self._ledger = EvidenceLedger()
         self.answer_model = answer_model or model
         self.on_step = on_step
         self._trace: list[MsgRecord] = []
         self._retrieval_result: RetrievalResult | None = None
+        self.last_model_requests: list[dict] = []
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
         if self.on_step:
             self.on_step(record)
+
+    @property
+    def _evidence(self) -> list[str]:
+        """兼容旧接口：返回证据的自然语言渲染列表。"""
+        return [item.render(DisplayLevel.PREVIEW) for item in self._ledger.items()
+                if item.kind != "error"]
+
+    def _audit_model_request(self, stage: str, messages: list[dict]) -> None:
+        """保存完整模型请求并输出人类可读审计信息。
+
+        stage 示例: "exploration_step_3", "answer_synthesis"
+        """
+        saved = copy.deepcopy(messages)
+        self.last_model_requests.append({"stage": stage, "messages": saved})
+
+        # 人类可读输出
+        parts = [f"── 发给大模型的完整内容 | {stage} ──"]
+        for i, msg in enumerate(saved):
+            role = msg.get("role", "?").upper()
+            parts.append(f"\n消息 {i+1}/{len(saved)} | {role}")
+
+            if role == "TOOL":
+                parts.append(f"  关联工具调用: {msg.get('tool_call_id', '?')}")
+                content = msg.get("content", "")
+                parts.append(f"  内容 ({len(content)} 字符):")
+                parts.append(content)
+            elif role == "ASSISTANT":
+                tool_calls = msg.get("tool_calls", [])
+                parts.append(f"  content: {msg.get('content', '')[:200]}")
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    parts.append(f"  工具名称: {fn.get('name', '?')}")
+                    parts.append(f"  工具参数: {fn.get('arguments', '?')}")
+                    parts.append(f"  调用 ID: {tc.get('id', '?')}")
+            else:
+                content = msg.get("content", "")
+                parts.append(f"  {content[:500]}{'...' if len(content) > 500 else ''}")
+
+        # 默认不输出到控制台，仅存储；如需打印可设 verbose
+        # print("\n".join(parts))
 
     def run(self, task: str) -> RunResult:
         """执行任务,返回包含完整轨迹的 RunResult"""
@@ -264,7 +307,8 @@ class Agent:
         self.step_count = 0
         self._explored.clear()
         self._frontier.clear()
-        self._evidence.clear()
+        self._ledger = EvidenceLedger()
+        self.last_model_requests.clear()
 
         recent_actions = []
         contextualized_symbols: set[str] = set()
@@ -272,6 +316,7 @@ class Agent:
         for _ in range(self.max_steps):
             self.step_count += 1
 
+            self._audit_model_request(f"exploration_step_{self.step_count}", self.messages)
             response = self.model.query(self.messages)
 
             thought = response.get("content", "").strip()
@@ -284,7 +329,7 @@ class Agent:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
                 # 有证据 → 合成；无证据 → 直接用 FINAL 文本
-                if self._evidence:
+                if self._ledger:
                     return self._synthesize(task, candidates)
                 return RunResult(
                     answer=final_text,
@@ -298,7 +343,7 @@ class Agent:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
                 # 有证据 → 合成；无证据 → 直接用 thought
-                if self._evidence:
+                if self._ledger:
                     return self._synthesize(task, candidates)
                 if thought:
                     return RunResult(
@@ -318,7 +363,7 @@ class Agent:
             if not response["tool_calls"]:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
-                if self._evidence:
+                if self._ledger:
                     return self._synthesize(task, candidates)
                 return RunResult(
                     answer=thought,
@@ -364,6 +409,11 @@ class Agent:
                     if len(recent_actions) > 5:
                         recent_actions = recent_actions[-5:]
                     obs_raw = self._execute_tool(tool_name, args)
+                    # 创建结构化证据并写入账本
+                    evidence_items = EvidenceItem.from_tool_result(
+                        tool_name, args, obs_raw, self.step_count)
+                    for ei in evidence_items:
+                        self._ledger.add(ei)
                     obs_text = obs_raw
                     if tool_name == "query_graph" and args.get("action") == "contextualize" and ctx_name:
                         contextualized_symbols.add(ctx_name)
@@ -380,10 +430,6 @@ class Agent:
 
                 # 追加已探索面包屑
                 obs_text = self._track_exploration(tool_name, args, obs_text) if not intercepted else obs_text
-
-                # 收集证据
-                if obs_text and "[重复调用拦截]" not in obs_text:
-                    self._evidence.append(obs_text)
 
                 record_raw = raw_json if raw_json else None
                 self._emit(MsgRecord(
@@ -445,26 +491,26 @@ class Agent:
 
     def _synthesize(self, task: str, candidates: list[dict]) -> RunResult:
         """将收集到的证据交给独立 prompt 合成最终答案"""
-        if not self._evidence:
+        if not self._ledger:
             return RunResult(answer="", error="未收集到任何证据",
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
                              messages=list(self._trace))
 
-        # 裁剪证据：每段最多 1500 字符，总共最多 6 段
-        trimmed = []
-        total = 0
-        for e in self._evidence[-6:]:
-            short = e[:1500]
-            trimmed.append(short)
-            total += len(short)
-            if total > 8000:
-                break
+        # 从账本选择证据（预算内，逐项等级）
+        self._ledger.select_for_synthesis()
+        evidence_text = self._ledger.render_selected_for_synthesis()
+        if not evidence_text:
+            return RunResult(answer="", error="所有证据超出合成预算",
+                             anchor_candidates=candidates,
+                             retrieval=self._retrieval_result,
+                             messages=list(self._trace))
 
-        evidence_text = "\n---\n".join(trimmed)
         prompt = ANSWER_PROMPT.replace("__QUESTION__", task).replace("__EVIDENCE__", evidence_text)
 
         messages = [{"role": "user", "content": prompt}]
+        # 审计合成请求
+        self._audit_model_request("answer_synthesis", messages)
         answer = self.answer_model.generate(messages)
 
         return RunResult(

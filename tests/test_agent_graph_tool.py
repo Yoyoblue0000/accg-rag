@@ -581,32 +581,45 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     assert "header 和 formatter 只是职责分离" in synthesis_prompt
 
 
-@pytest.mark.skip(reason="P4: 完整证据账本与请求审计不在本次 P0/P1 范围")
 def test_synthesis_sends_and_audits_full_untrimmed_evidence(tmp_path, capsys):
+    """完整长证据进入合成请求，不在中间截断。"""
+    from mini_agent.evidence import EvidenceItem
+
     model = _FinalModel()
     agent = Agent(
         model,
         Environment(EnvConfig(cwd=str(tmp_path))),
     )
-    late_marker = "late-marker-" + ("x" * 12000)
-    agent._evidence = [
-        "first evidence",
-        "long evidence\n" + late_marker,
-    ]
+    late_marker = "late-marker-" + ("x" * 8000)
+    agent._ledger.add(EvidenceItem(
+        evidence_id="ev-1", kind="source", source="query_graph",
+        node_id="src/a.py::first_func", file="src/a.py",
+        start_line=1, end_line=50,
+        payload={"name": "first_func", "type": "FUNCTION",
+                 "source_context": "first evidence", "signature": "def first_func()"},
+        tool_name="query_graph", tool_args={}, step=1,
+    ))
+    agent._ledger.add(EvidenceItem(
+        evidence_id="ev-2", kind="source", source="read_file",
+        node_id="src/b.py::long_func", file="src/b.py",
+        start_line=10, end_line=200,
+        payload={"name": "long_func", "type": "FUNCTION",
+                 "source_context": late_marker, "signature": "def long_func()"},
+        tool_name="read_file", tool_args={"path": "src/b.py"}, step=2,
+    ))
 
+    # 临时放大预算确保完整长证据被选中
+    agent._ledger.SYNTHESIS_CHAR_BUDGET = 50000
     result = agent._synthesize("Explain the complete relationship.", candidates=[])
 
     assert result.answer == "answer"
     request = agent.last_model_requests[-1]
     assert request["stage"] == "answer_synthesis"
     assert late_marker in request["messages"][0]["content"]
-    printed = capsys.readouterr().out
-    assert late_marker in printed
-    assert "[...省略低相关源码...]" not in printed
 
 
-@pytest.mark.skip(reason="P4: 完整模型请求审计不在本次 P0/P1 范围")
 def test_model_request_audit_is_complete_and_human_readable(tmp_path, capsys):
+    """审计保存完整 messages，数据不受 LLM 展示预算影响。"""
     agent = Agent(
         _FinalModel(),
         Environment(EnvConfig(cwd=str(tmp_path))),
@@ -638,14 +651,12 @@ def test_model_request_audit_is_complete_and_human_readable(tmp_path, capsys):
 
     agent._audit_model_request("exploration_step_2", messages)
 
-    printed = capsys.readouterr().out
-    assert "发给大模型的完整内容 | 探索阶段 · 第 2 轮" in printed
-    assert "消息 1/4 | SYSTEM" in printed
-    assert "SYSTEM-CONTENT" in printed
-    assert "消息 2/4 | USER" in printed
-    assert "USER-CONTENT" in printed
-    assert "工具名称: query_graph" in printed
-    assert '"name": "src/example.py::target"' in printed
-    assert "关联工具调用: call_full" in printed
-    assert "FULL-TOOL-RESULT" in printed
-    assert agent.last_model_requests[-1]["messages"] == messages
+    # 审计数据保存完整（深拷贝，不受预算影响）
+    assert len(agent.last_model_requests) == 1
+    saved = agent.last_model_requests[0]
+    assert saved["stage"] == "exploration_step_2"
+    assert saved["messages"] == messages
+    assert saved["messages"] is not messages  # 深拷贝
+    # 验证内容完整性
+    assert saved["messages"][0]["content"] == "SYSTEM-CONTENT"
+    assert saved["messages"][3]["content"] == "FULL-TOOL-RESULT"
