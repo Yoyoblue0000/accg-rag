@@ -96,20 +96,69 @@ Agent.run(task)
 | read_file | 文件 | 读文件（支持行号和上下文窗口） |
 | list_dir | 文件 | 列出目录内容 |
 
-## 服务器部署
+## 服务器验证
+
+Agent 依赖 Ollama 进行 LLM 推理和 embedding，本地 GPU 有限，所有 QA 批量测试必须在服务器上验证。
+
+### 服务器环境
+
+| 项目 | 详情 |
+|---|---|
+| 地址 | `ssh amd-jk6kg8k@10.67.8.138`（密钥 `~/.ssh/id_ed25519`） |
+| 硬件 | AMD Ryzen AI MAX+ 395，128GB 统一内存，Radeon 8060S GPU（gfx1151） |
+| Python | `~/.local/bin/uv run python` |
+| Ollama API | `http://localhost:11434/v1` |
+| GPU 驱动 | ROCm 7.2.3，amdgpu 6.16.13 |
+| 可用显存 | ~111.5 GiB（统一内存架构） |
+
+### GPU 模型兼容性
+
+⚠️ **Qwen3 全系（含 MoE）在 gfx1151 上输出为空，不可用。**
+
+| 模型 | 架构 | GPU | 速度 | 备注 |
+|---|---|---|---|---|
+| qwen2.5-coder:14b | Dense 14.8B | ✅ | 19 t/s | **当前默认** |
+| qwen2.5:72b | Dense 72.7B | ✅ | 4.5 t/s | 太慢，不适合批量 |
+| qwen2.5:14b | Dense 14.8B | ✅ | ~20 t/s | 通用版 |
+| qwen3:30b | MoE 30.5B | ❌ | — | GPU 输出为空 |
+| nomic-embed-text | 137M | ✅ | 15ms | Embedding，必须保留 |
+
+### 同步+验证流程
 
 ```bash
-# 同步代码
+# 增量同步：打包 → 上传 → 解压 → 安装
 tar czf /tmp/accg_sync.tar.gz --exclude='.venv' --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' .
 scp -i ~/.ssh/id_ed25519 /tmp/accg_sync.tar.gz amd-jk6kg8k@10.67.8.138:~/program/accg-rag/
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e ."
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e . && echo SYNC_OK"
 
-# 运行 QA
+# QA 全量（静默，仅输出汇总表）
 ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
   --project-path ~/program/test_repos/requests_repo \
   --qa-path ~/program/test_repos/sweqa_requests.json \
   --model qwen2.5-coder:14b-instruct --limit 20"
+
+# QA 单题 + verbose（调试用）
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
+  --project-path ~/program/test_repos/requests_repo \
+  --qa-path ~/program/test_repos/sweqa_requests.json \
+  --model qwen2.5-coder:14b-instruct --id 1 -v"
+
+# 查看 GPU 状态
+ssh amd-jk6kg8k@10.67.8.138 "rocm-smi"
+# 查看 Ollama 推理日志
+ssh amd-jk6kg8k@10.67.8.138 "journalctl -u ollama --no-pager --since '2 min ago'"
+# 查看 QA 进度
+ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_results.json | python3 -c 'import json; d=json.load(open(\"/tmp/qa_results.json\")); print(len(d), \"done\")'"
 ```
+
+### 常见问题排查
+
+| 症状 | 可能原因 | 解决 |
+|---|---|---|
+| QA 进程卡住 | 前次残留进程抢 GPU | `pkill -f run_qa.py` |
+| 输出全为空 | 用了 qwen3 系列 | 换 `--model qwen2.5-coder:14b-instruct` |
+| embedding 极慢 | 多模型抢 VRAM | `sudo systemctl restart ollama` |
+| `finish_reason` 为 None | Ollama 版本太旧 | 升级到 0.24.0+ |
 
 ## 编码规范
 
