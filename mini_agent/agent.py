@@ -41,6 +41,9 @@ class RunResult:
     retrieval: RetrievalResult | None = None
     messages: list[MsgRecord] = field(default_factory=list)
     synthesis: SynthesisRecord | None = None
+    evidence: list[EvidenceItem] = field(default_factory=list)
+    evidence_selection_report: str | None = None
+    model_requests: list[dict] = field(default_factory=list)
 
     @property
     def rounds(self) -> int:
@@ -173,6 +176,10 @@ __QUESTION__
 
 __EVIDENCE__
 
+## Agent 结束草稿（仅供参考，不属于证据）
+
+__DRAFT__
+
 ## 请回答
 """
 
@@ -182,7 +189,16 @@ class Agent:
 
     MAX_EXPLORATION_DEPTH = 3
 
-    def __init__(self, model: Model, env: Environment, graph_tool=None, max_steps: int = 15, answer_model=None, on_step: Callable[["MsgRecord"], None] | None = None):
+    def __init__(
+        self,
+        model: Model,
+        env: Environment,
+        graph_tool=None,
+        max_steps: int = 15,
+        answer_model=None,
+        on_step: Callable[["MsgRecord"], None] | None = None,
+        on_audit: Callable[[str], None] | None = None,
+    ):
         self.model = model
         self.env = env
         self.graph_tool = graph_tool
@@ -194,9 +210,11 @@ class Agent:
         self._ledger = EvidenceLedger()
         self.answer_model = answer_model or model
         self.on_step = on_step
+        self.on_audit = on_audit
         self._trace: list[MsgRecord] = []
         self._retrieval_result: RetrievalResult | None = None
         self.last_model_requests: list[dict] = []
+        self._full_tool_results: dict[str, str] = {}
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -209,13 +227,13 @@ class Agent:
         return [item.render(DisplayLevel.PREVIEW) for item in self._ledger.items()
                 if item.kind != "error"]
 
-    def _audit_model_request(self, stage: str, messages: list[dict]) -> None:
+    def _audit_model_request(self, stage: str, messages: list[dict]) -> str:
         """保存完整模型请求并输出人类可读审计信息。
 
         stage 示例: "exploration_step_3", "answer_synthesis"
         """
         saved = copy.deepcopy(messages)
-        self.last_model_requests.append({"stage": stage, "messages": saved})
+        full_tool_results = copy.deepcopy(self._full_tool_results)
 
         # 人类可读输出
         parts = [f"── 发给大模型的完整内容 | {stage} ──"]
@@ -224,13 +242,14 @@ class Agent:
             parts.append(f"\n消息 {i+1}/{len(saved)} | {role}")
 
             if role == "TOOL":
-                parts.append(f"  关联工具调用: {msg.get('tool_call_id', '?')}")
-                content = msg.get("content", "")
+                call_id = msg.get("tool_call_id", "?")
+                parts.append(f"  关联工具调用: {call_id}")
+                content = full_tool_results.get(call_id, msg.get("content", ""))
                 parts.append(f"  内容 ({len(content)} 字符):")
                 parts.append(content)
             elif role == "ASSISTANT":
                 tool_calls = msg.get("tool_calls", [])
-                parts.append(f"  content: {msg.get('content', '')[:200]}")
+                parts.append(f"  content: {msg.get('content', '')}")
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     parts.append(f"  工具名称: {fn.get('name', '?')}")
@@ -238,10 +257,18 @@ class Agent:
                     parts.append(f"  调用 ID: {tc.get('id', '?')}")
             else:
                 content = msg.get("content", "")
-                parts.append(f"  {content[:500]}{'...' if len(content) > 500 else ''}")
+                parts.append(f"  {content}")
 
-        # 默认不输出到控制台，仅存储；如需打印可设 verbose
-        # print("\n".join(parts))
+        audit_text = "\n".join(parts)
+        self.last_model_requests.append({
+            "stage": stage,
+            "messages": saved,
+            "audit_text": audit_text,
+            "full_tool_results": full_tool_results,
+        })
+        if self.on_audit:
+            self.on_audit(audit_text)
+        return audit_text
 
     def run(self, task: str) -> RunResult:
         """执行任务,返回包含完整轨迹的 RunResult"""
@@ -309,6 +336,7 @@ class Agent:
         self._frontier.clear()
         self._ledger = EvidenceLedger()
         self.last_model_requests.clear()
+        self._full_tool_results.clear()
 
         recent_actions = []
         contextualized_symbols: set[str] = set()
@@ -329,8 +357,8 @@ class Agent:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
                 # 有证据 → 合成；无证据 → 直接用 FINAL 文本
-                if self._ledger:
-                    return self._synthesize(task, candidates)
+                if self._ledger.has_synthesis_evidence:
+                    return self._synthesize(task, candidates, draft=final_text)
                 return RunResult(
                     answer=final_text,
                     anchor_candidates=candidates,
@@ -343,8 +371,8 @@ class Agent:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
                 # 有证据 → 合成；无证据 → 直接用 thought
-                if self._ledger:
-                    return self._synthesize(task, candidates)
+                if self._ledger.has_synthesis_evidence:
+                    return self._synthesize(task, candidates, draft=thought)
                 if thought:
                     return RunResult(
                         answer=thought,
@@ -363,8 +391,8 @@ class Agent:
             if not response["tool_calls"]:
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
-                if self._ledger:
-                    return self._synthesize(task, candidates)
+                if self._ledger.has_synthesis_evidence:
+                    return self._synthesize(task, candidates, draft=thought)
                 return RunResult(
                     answer=thought,
                     anchor_candidates=candidates,
@@ -396,6 +424,7 @@ class Agent:
                     and ctx_name in contextualized_symbols
                 )
                 intercepted = (action_key in recent_actions[-5:]) or is_dup_ctx
+                evidence_items = []
 
                 if intercepted:
                     obs_raw = ""
@@ -414,13 +443,16 @@ class Agent:
                         tool_name, args, obs_raw, self.step_count)
                     for ei in evidence_items:
                         self._ledger.add(ei)
-                    obs_text = obs_raw
+                    obs_text = self._ledger.render_for_observation(evidence_items)
+                    if not obs_text:
+                        obs_text = self._format_for_llm(obs_raw, tool_name, args)
                     if tool_name == "query_graph" and args.get("action") == "contextualize" and ctx_name:
                         contextualized_symbols.add(ctx_name)
 
-                # JSON 结果转自然语言
+                # 控制消息不进入账本，仅附加到本轮 observation。
                 raw_json = obs_text if not intercepted else ""
-                obs_text = self._format_for_llm(obs_text, tool_name, args) if not intercepted else obs_text
+                if not intercepted:
+                    raw_json = obs_raw
 
                 # 继承收敛分析
                 if not intercepted and tool_name == "query_graph" and args.get("action") == "contextualize":
@@ -443,6 +475,8 @@ class Agent:
                     "content": obs_text,
                     "tool_call_id": tc["id"],
                 })
+                if not intercepted:
+                    self._full_tool_results[tc["id"]] = obs_raw
 
         return RunResult(
             answer="[达到最大步数]",
@@ -489,24 +523,35 @@ class Agent:
             f"汇聚到此的每个 via_class 都是一条独立证据，无需逐一验证各子类"
         )
 
-    def _synthesize(self, task: str, candidates: list[dict]) -> RunResult:
+    def _synthesize(
+        self,
+        task: str,
+        candidates: list[dict],
+        draft: str | None = None,
+    ) -> RunResult:
         """将收集到的证据交给独立 prompt 合成最终答案"""
-        if not self._ledger:
+        if not self._ledger.has_synthesis_evidence:
             return RunResult(answer="", error="未收集到任何证据",
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
                              messages=list(self._trace))
 
         # 从账本选择证据（预算内，逐项等级）
-        self._ledger.select_for_synthesis()
+        selected = self._ledger.select_for_synthesis()
         evidence_text = self._ledger.render_selected_for_synthesis()
+        selection_report = self._ledger.selection_report()
         if not evidence_text:
             return RunResult(answer="", error="所有证据超出合成预算",
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
                              messages=list(self._trace))
 
-        prompt = ANSWER_PROMPT.replace("__QUESTION__", task).replace("__EVIDENCE__", evidence_text)
+        prompt = (
+            ANSWER_PROMPT
+            .replace("__QUESTION__", task)
+            .replace("__EVIDENCE__", evidence_text)
+            .replace("__DRAFT__", draft or "无")
+        )
 
         messages = [{"role": "user", "content": prompt}]
         # 审计合成请求
@@ -519,10 +564,13 @@ class Agent:
             retrieval=self._retrieval_result,
             messages=list(self._trace),
             synthesis=SynthesisRecord(prompt=prompt, answer=answer),
+            evidence=list(selected),
+            evidence_selection_report=selection_report,
+            model_requests=copy.deepcopy(self.last_model_requests),
         )
 
     def _execute_tool(self, name: str, args: dict) -> str:
-        """执行工具,返回 (obs_text, is_exit, submission)"""
+        """执行工具并返回未裁剪结果，展示预算由证据账本负责。"""
         if name == "read_file":
             try:
                 result = self.env.read_file(
@@ -543,7 +591,11 @@ class Agent:
                 return f"[错误] list_dir 失败: {e}"
 
         elif name == "query_graph":
-            return self.graph_tool.execute(**args) if self.graph_tool else '{"error":"图工具未初始化"}'
+            if not self.graph_tool:
+                return '{"error":"图工具未初始化"}'
+            if hasattr(self.graph_tool, "execute_full"):
+                return self.graph_tool.execute_full(**args)
+            return self.graph_tool.execute(**args)
 
         else:
             return f"[错误] 未知工具: {name}"

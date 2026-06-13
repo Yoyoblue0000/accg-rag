@@ -262,6 +262,7 @@ def main():
                 graph_tool=graph_tool,
                 max_steps=12,
                 on_step=_on_step,
+                on_audit=print if verbosity >= 2 else None,
             )
             result = agent.run(question)
 

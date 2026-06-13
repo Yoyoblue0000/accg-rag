@@ -252,13 +252,26 @@ class GraphTool:
         return self._built
 
     def execute(self, action: str, **kwargs) -> str:
+        """执行图查询并返回适合探索消息展示的裁剪结果。"""
+        return self._trim(self.execute_raw(action, **kwargs))
+
+    def execute_full(self, action: str, **kwargs) -> str:
+        """执行图查询并返回未裁剪 JSON，供证据账本和审计使用。"""
+        return json.dumps(
+            self.execute_raw(action, **kwargs),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+    def execute_raw(self, action: str, **kwargs):
+        """执行图查询并保留原始结构化结果。"""
         if not self._built:
-            return json.dumps({"error": "图尚未构建"}, ensure_ascii=False)
+            return {"error": "图尚未构建"}
         try:
-            result = self._dispatch(action, kwargs)
-            return self._trim(result)
+            return self._dispatch(action, kwargs)
         except Exception as e:
-            return json.dumps({"error": str(e), "action": action}, ensure_ascii=False)
+            return {"error": str(e), "action": action}
 
     # ── 裁剪 ──────────────────────────────────────────────
 
@@ -335,7 +348,41 @@ class GraphTool:
                                               min_confidence=min_conf)
 
     def _handle_class_hierarchy(self, args: dict):
-        return self._query.class_hierarchy(args.get("class_name", ""))
+        class_name = args.get("class_name", "")
+        simple_name = class_name.split("::")[-1]
+        class_ids = []
+        if class_name in self._graph.nodes:
+            class_ids.append(class_name)
+        else:
+            for node_id, data in self._graph.nodes(data=True):
+                node_type = data.get("node_type")
+                type_name = getattr(node_type, "name", str(node_type))
+                if data.get("name") == simple_name and type_name == "CLASS":
+                    class_ids.append(node_id)
+
+        results = []
+        for class_id in sorted(class_ids):
+            parents = []
+            children = []
+            for _, parent_id, data in self._graph.out_edges(class_id, data=True):
+                if data.get("edge_type") == EdgeType.INHERITS:
+                    parents.append(self._query.node_info(parent_id))
+            for child_id, _, data in self._graph.in_edges(class_id, data=True):
+                if data.get("edge_type") == EdgeType.INHERITS:
+                    children.append(self._query.node_info(child_id))
+            results.extend([
+                {
+                    "class_node_id": class_id,
+                    "type": "parents",
+                    "items": parents,
+                },
+                {
+                    "class_node_id": class_id,
+                    "type": "children",
+                    "items": children,
+                },
+            ])
+        return results
 
     def _handle_module_tree(self, args: dict):
         return self._query.module_tree(args.get("prefix", ""))

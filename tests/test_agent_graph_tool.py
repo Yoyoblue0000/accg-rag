@@ -11,6 +11,7 @@ from accg.models import EdgeType, NodeType
 from accg.query import GraphQuery
 from mini_agent.agent import Agent
 from mini_agent.environment import EnvConfig, Environment
+from mini_agent.evidence import EvidenceItem
 from mini_agent.graph_tool import GraphTool
 
 
@@ -358,6 +359,64 @@ def test_path_and_decorator_fields_are_searchable(tmp_path):
     assert {"file", "decorator"} <= set(candidates[0]["matched_fields"])
 
 
+def test_class_hierarchy_returns_resolved_node_ids_and_correct_direction(tmp_path):
+    graph = nx.MultiDiGraph()
+    _add_symbol(
+        graph,
+        "src/base.py::Base",
+        NodeType.CLASS,
+        "Base",
+        "src/base.py",
+    )
+    _add_symbol(
+        graph,
+        "src/current.py::Current",
+        NodeType.CLASS,
+        "Current",
+        "src/current.py",
+    )
+    _add_symbol(
+        graph,
+        "src/child.py::Child",
+        NodeType.CLASS,
+        "Child",
+        "src/child.py",
+    )
+    graph.add_edge(
+        "src/current.py::Current",
+        "src/base.py::Base",
+        edge_type=EdgeType.INHERITS,
+    )
+    graph.add_edge(
+        "src/child.py::Child",
+        "src/current.py::Current",
+        edge_type=EdgeType.INHERITS,
+    )
+    tool = _graph_tool(graph, tmp_path)
+
+    raw = tool.execute_full(
+        "class_hierarchy",
+        class_name="src/current.py::Current",
+    )
+    items = EvidenceItem.from_tool_result(
+        "query_graph",
+        {
+            "action": "class_hierarchy",
+            "class_name": "src/current.py::Current",
+        },
+        raw,
+        step=1,
+    )
+
+    assert {
+        (item.source_node_id, item.target_node_id)
+        for item in items
+    } == {
+        ("src/current.py::Current", "src/base.py::Base"),
+        ("src/child.py::Child", "src/current.py::Current"),
+    }
+
+
 class _FinalModel:
     def __init__(self):
         self.last_messages = None
@@ -620,9 +679,11 @@ def test_synthesis_sends_and_audits_full_untrimmed_evidence(tmp_path, capsys):
 
 def test_model_request_audit_is_complete_and_human_readable(tmp_path, capsys):
     """审计保存完整 messages，数据不受 LLM 展示预算影响。"""
+    audit_output = []
     agent = Agent(
         _FinalModel(),
         Environment(EnvConfig(cwd=str(tmp_path))),
+        on_audit=audit_output.append,
     )
     messages = [
         {"role": "system", "content": "SYSTEM-CONTENT"},
@@ -660,3 +721,119 @@ def test_model_request_audit_is_complete_and_human_readable(tmp_path, capsys):
     # 验证内容完整性
     assert saved["messages"][0]["content"] == "SYSTEM-CONTENT"
     assert saved["messages"][3]["content"] == "FULL-TOOL-RESULT"
+    assert len(audit_output) == 1
+    assert "消息 1/4 | SYSTEM" in audit_output[0]
+    assert "工具名称: query_graph" in audit_output[0]
+    assert "调用 ID: call_full" in audit_output[0]
+    assert "FULL-TOOL-RESULT" in audit_output[0]
+
+
+def test_graph_tool_full_result_channel_bypasses_display_trimming(tmp_path):
+    tool = GraphTool(str(tmp_path))
+    tool._built = True
+    marker = "late-marker-" + ("x" * 4000)
+    tool._dispatch = lambda action, args: {
+        "results": [{"id": f"node-{i}", "source_context": marker} for i in range(12)],
+    }
+
+    display_result = tool.execute("contextualize", name="target")
+    full_result = tool.execute_full("contextualize", name="target")
+
+    assert len(json.loads(display_result)["results"]) == 10
+    assert marker in full_result
+    assert len(json.loads(full_result)["results"]) == 12
+
+
+def test_agent_keeps_full_tool_result_while_budgeting_observation(tmp_path):
+    marker = "FULL_LEDGER_MARKER_" + ("x" * 9000)
+
+    class _Retrieval:
+        candidates = []
+
+    class _FullGraphTool:
+        is_ready = True
+        enable_embeddings = False
+
+        def __init__(self):
+            self.full_calls = 0
+
+        def ensure_built(self):
+            return "ready"
+
+        def retrieve_query_candidates(self, *args, **kwargs):
+            return _Retrieval()
+
+        def execute(self, **kwargs):
+            raise AssertionError("Agent 不应使用裁剪通道")
+
+        def execute_full(self, **kwargs):
+            self.full_calls += 1
+            return json.dumps({
+                "query": "src/a.py::large",
+                "exact": True,
+                "results": [{
+                    "id": "src/a.py::large",
+                    "name": "large",
+                    "type": "FUNCTION",
+                    "file": "src/a.py",
+                    "start_line": 1,
+                    "end_line": 300,
+                    "source_context": marker,
+                    "calls": [],
+                    "called_by": [],
+                }],
+            })
+
+    class _ToolThenFinalModel:
+        def __init__(self):
+            self.query_messages = []
+            self.generate_messages = []
+
+        def query(self, messages):
+            self.query_messages.append(copy.deepcopy(messages))
+            if len(self.query_messages) == 1:
+                return {
+                    "content": "读取目标",
+                    "raw_content": "THOUGHT: 读取目标",
+                    "tool_calls": [{
+                        "id": "call_full_result",
+                        "type": "function",
+                        "function": {
+                            "name": "query_graph",
+                            "arguments": json.dumps({
+                                "action": "contextualize",
+                                "name": "src/a.py::large",
+                            }),
+                        },
+                    }],
+                }
+            return {
+                "content": "证据足够",
+                "raw_content": "FINAL: 初步结论",
+                "tool_calls": [],
+            }
+
+        def generate(self, messages):
+            self.generate_messages = copy.deepcopy(messages)
+            return "最终答案"
+
+    graph_tool = _FullGraphTool()
+    model = _ToolThenFinalModel()
+    audit_output = []
+    agent = Agent(
+        model,
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=graph_tool,
+        on_audit=audit_output.append,
+    )
+
+    result = agent.run("解释 large")
+
+    assert graph_tool.full_calls == 1
+    assert marker not in model.query_messages[1][-1]["content"]
+    assert marker in result.evidence[0].payload["source_context"]
+    assert marker in model.generate_messages[0]["content"]
+    assert "Agent 结束草稿（仅供参考，不属于证据）" in result.synthesis.prompt
+    assert "初步结论" in result.synthesis.prompt
+    assert marker in result.model_requests[-1]["full_tool_results"]["call_full_result"]
+    assert marker in audit_output[-1]

@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
-import uuid
+import re
 from dataclasses import dataclass, field
 
 
@@ -31,7 +32,7 @@ _RELATION_KEY_FIELDS = {
 
 @dataclass
 class EvidenceItem:
-    """不可变证据项，包含完整 payload 和结构化的位置/关系元数据。"""
+    """受控更新的证据项，包含完整 payload 和结构化元数据。"""
 
     evidence_id: str
     kind: str                     # "source" | "relation" | "candidate" | "structure" | "error"
@@ -51,18 +52,48 @@ class EvidenceItem:
     tool_name: str = ""
     tool_args: dict = field(default_factory=dict)
     step: int = 0
+    sources: list[str] = field(default_factory=list)
+    tool_origins: list[dict] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.retrieval_stage is None:
+            self.retrieval_stage = self.tool_args.get("action") or self.tool_name or None
+        if self.source and self.source not in set(self.sources):
+            self.sources.append(self.source)
+        self._record_tool_origin(self.tool_name, self.tool_args, self.step)
+
+    def _record_tool_origin(self, tool_name: str, tool_args: dict, step: int) -> None:
+        if not tool_name:
+            return
+        origin = {
+            "tool_name": tool_name,
+            "tool_args": dict(tool_args),
+            "step": step,
+        }
+        known = {
+            json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            for item in self.tool_origins
+        }
+        key = json.dumps(origin, ensure_ascii=False, sort_keys=True, default=str)
+        if key not in known:
+            self.tool_origins.append(origin)
 
     # ── 去重键 ──────────────────────────────────────────────
 
     def dedup_keys(self) -> list[str]:
         """返回去重键列表，同一 item 可匹配多个键。"""
         keys = []
-        if self.node_id:
-            keys.append(f"node:{self.node_id}")
-        if self.source_node_id and self.target_node_id and self.edge_type:
+        if self.kind == "source" and self.node_id:
+            keys.append(f"source-node:{self.node_id}")
+        elif self.kind == "candidate" and self.node_id:
+            keys.append(f"candidate-node:{self.node_id}")
+        if self.kind == "relation" and self.source_node_id and self.target_node_id and self.edge_type:
             keys.append(f"edge:{self.source_node_id}:{self.edge_type}:{self.target_node_id}")
-        if self.file and self.start_line:
-            keys.append(f"range:{self.file}:{self.start_line}:{self.end_line or self.start_line}")
+        if self.kind == "source" and self.file and self.start_line:
+            keys.append(
+                f"source-range:{self.file}:{self.start_line}:"
+                f"{self.end_line or self.start_line}"
+            )
         return keys
 
     # ── 渲染 ────────────────────────────────────────────────
@@ -91,6 +122,8 @@ class EvidenceItem:
         sig = p.get("signature", "")
         doc = p.get("docstring", "")
         sc = p.get("source_context", "")
+        if not sc and isinstance(self.payload, str):
+            sc = self.payload
 
         if level == DisplayLevel.FOLD:
             return f"[{nt}] {name} ({f}:{sl}-{el})"
@@ -125,15 +158,13 @@ class EvidenceItem:
 
         # COMPLETE
         lines = [f"[{nt}] {name} ({f}:{sl}-{el})"]
+        lines.append(self._provenance_line())
         if sig:
             lines.append(f"  签名: {sig}")
         if doc:
             lines.append(f"  文档: {doc.strip()}")
         if sc:
             lines.append(f"  源码:\n{sc}")
-        rel_lines = self._relation_summary(p)
-        if rel_lines:
-            lines.extend(rel_lines)
         return "\n".join(lines)
 
     def _render_relation(self, level: DisplayLevel) -> str:
@@ -146,7 +177,23 @@ class EvidenceItem:
         if isinstance(p, list):
             items = p
         if not items:
-            return f"[{et}] {src} → {tgt}"
+            lines = [f"[{et}] {src} → {tgt}"]
+            if level == DisplayLevel.FOLD:
+                return lines[0]
+            if self.confidence is not None:
+                lines.append(f"  confidence: {self.confidence}")
+            if self.strategy:
+                lines.append(f"  strategy: {self.strategy}")
+            if level == DisplayLevel.COMPLETE:
+                lines.append(self._provenance_line())
+                payload_text = (
+                    self.payload
+                    if isinstance(self.payload, str)
+                    else json.dumps(self.payload, ensure_ascii=False, indent=2, default=str)
+                )
+                if payload_text:
+                    lines.append(f"  完整关系数据:\n{payload_text}")
+            return "\n".join(lines)
 
         if level == DisplayLevel.FOLD:
             return f"[{et}] {src} → {tgt}"
@@ -167,9 +214,18 @@ class EvidenceItem:
             return "\n".join(lines)
 
         # COMPLETE
+        lines.append(self._provenance_line())
+        if self.confidence is not None:
+            lines.append(f"  confidence: {self.confidence}")
+        if self.strategy:
+            lines.append(f"  strategy: {self.strategy}")
         for item in (items if isinstance(items, list) else []):
             lines.append(f"  - {self._edge_str(item)}")
         return "\n".join(lines)
+
+    def _provenance_line(self) -> str:
+        sources = ",".join(self.sources) if self.sources else self.source
+        return f"  来源: {sources}; evidence_id={self.evidence_id}; step={self.step}"
 
     def _render_candidate(self, level: DisplayLevel) -> str:
         p = self.payload if isinstance(self.payload, dict) else {}
@@ -181,9 +237,14 @@ class EvidenceItem:
         score = p.get("score", p.get("relevance", "?"))
         sources = p.get("sources", [])
         src_str = ",".join(sources) if sources else "?"
-        return f"[候选] {name} ({nt}, {f}) score={score} sources={src_str}"
+        text = f"[候选] {name} ({nt}, {f}) score={score} sources={src_str}"
+        if level == DisplayLevel.COMPLETE:
+            text += "\n" + self._provenance_line()
+        return text
 
     def _render_structure(self, level: DisplayLevel) -> str:
+        if level == DisplayLevel.FOLD:
+            return f"[结构] source={self.source}"
         return str(self.payload) if isinstance(self.payload, str) else json.dumps(
             self.payload, ensure_ascii=False, indent=2, default=str)
 
@@ -248,20 +309,50 @@ class EvidenceItem:
     @classmethod
     def from_tool_result(cls, tool_name: str, args: dict, raw_result: str, step: int) -> list[EvidenceItem]:
         """从工具执行结果创建 EvidenceItem 列表。"""
-        eid_prefix = uuid.uuid4().hex[:8]
-
+        eid_prefix = "pending"
         if tool_name == "query_graph":
-            return cls._from_graph_result(tool_name, args, raw_result, step, eid_prefix)
+            items = cls._from_graph_result(tool_name, args, raw_result, step, eid_prefix)
         elif tool_name == "read_file":
-            return cls._from_read_file(args, raw_result, step, eid_prefix)
+            items = cls._from_read_file(args, raw_result, step, eid_prefix)
         elif tool_name == "list_dir":
-            return cls._from_list_dir(args, raw_result, step, eid_prefix)
+            items = cls._from_list_dir(args, raw_result, step, eid_prefix)
+        else:
+            items = [cls(
+                evidence_id=f"{eid_prefix}-0",
+                kind="error", source=tool_name,
+                payload=raw_result, tool_name=tool_name, tool_args=args, step=step,
+            )]
+        for item in items:
+            item.evidence_id = cls._stable_evidence_id(item)
+        return items
 
-        return [cls(
-            evidence_id=f"{eid_prefix}-0",
-            kind="error", source=tool_name,
-            payload=raw_result, tool_name=tool_name, tool_args=args, step=step,
-        )]
+    @staticmethod
+    def _stable_evidence_id(item: EvidenceItem) -> str:
+        keys = item.dedup_keys()
+        preferred_key = None
+        for prefix in (
+            "source-node:",
+            "edge:",
+            "candidate-node:",
+            "source-range:",
+        ):
+            preferred_key = next(
+                (key for key in keys if key.startswith(prefix)),
+                None,
+            )
+            if preferred_key:
+                break
+        identity = {"kind": item.kind, "key": preferred_key}
+        if preferred_key is None:
+            identity.update({
+                "source": item.source,
+                "file": item.file,
+                "tool_name": item.tool_name,
+                "tool_args": item.tool_args,
+                "payload": item.payload,
+            })
+        raw = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        return f"ev-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
     @classmethod
     def _from_graph_result(cls, tool_name: str, args: dict, raw_result: str, step: int, eid_prefix: str) -> list[EvidenceItem]:
@@ -275,7 +366,11 @@ class EvidenceItem:
                 payload=raw_result, tool_name=tool_name, tool_args=args, step=step,
             )]
 
-        if "error" in data and not isinstance(data.get("error"), dict):
+        if (
+            isinstance(data, dict)
+            and "error" in data
+            and not isinstance(data.get("error"), dict)
+        ):
             return [cls(
                 evidence_id=f"{eid_prefix}-0",
                 kind="error", source=tool_name,
@@ -341,7 +436,7 @@ class EvidenceItem:
                     evidence_id=f"{eid_prefix}-calledby-{i}-{j}",
                     kind="relation", source="query_graph",
                     node_id=c.get("id", ""), file=c.get("file", ""),
-                    edge_type="CALLED_BY", source_node_id=c.get("id", ""), target_node_id=nid,
+                    edge_type="CALLS", source_node_id=c.get("id", ""), target_node_id=nid,
                     confidence=c.get("confidence"), strategy=c.get("strategy"),
                     payload=c, complete=True,
                     tool_name="query_graph", tool_args=args, step=step,
@@ -355,11 +450,16 @@ class EvidenceItem:
                 for k, hi in enumerate(h_items):
                     hi_id = hi.get("id", hi.get("name", "")) if isinstance(hi, dict) else str(hi)
                     hi_name = hi.get("name", str(hi)) if isinstance(hi, dict) else str(hi)
-                    rel_payload = {"type": htype, "name": hi_name, "id": hi_id}
+                    rel_payload = {
+                        "type": htype,
+                        "name": hi_name,
+                        "id": hi_id,
+                        "hierarchy_item": hi,
+                    }
                     if htype == "parents":
-                        src_id, tgt_id = hi_id, nid
-                    else:
                         src_id, tgt_id = nid, hi_id
+                    else:
+                        src_id, tgt_id = hi_id, nid
                     items.append(cls(
                         evidence_id=f"{eid_prefix}-inherits-{i}-{j}-{k}",
                         kind="relation", source="query_graph",
@@ -389,7 +489,7 @@ class EvidenceItem:
         """从传递调用结果创建关系证据。"""
         items_list = data if isinstance(data, list) else data.get("items", data.get("results", []))
         symbol = args.get("symbol", "")
-        edge_type = "CALLED_BY" if action == "transitive_callers" else "CALLS"
+        edge_type = "CALLS"
 
         items = []
         for i, entry in enumerate(items_list):
@@ -401,44 +501,79 @@ class EvidenceItem:
                     kind="relation", source="query_graph",
                     node_id=nid, file=info.get("file", ""),
                     edge_type=edge_type,
-                    source_node_id=symbol if edge_type == "CALLS" else nid,
-                    target_node_id=nid if edge_type == "CALLS" else symbol,
+                    source_node_id=nid if action == "transitive_callers" else symbol,
+                    target_node_id=symbol if action == "transitive_callers" else nid,
                     confidence=edge.get("confidence"), strategy=edge.get("strategy"),
                     payload={"info": info, "edge": edge}, complete=True,
                     tool_name="query_graph", tool_args=args, step=step,
                 ))
             elif isinstance(entry, dict):
-                nid = entry.get("id", "")
+                path_edges = entry.get("edges", [])
+                if path_edges:
+                    path_node_ids = entry.get("node_ids", [])
+                    for j, edge in enumerate(path_edges):
+                        if not isinstance(edge, dict):
+                            continue
+                        src_id = edge.get("source_node_id", "")
+                        tgt_id = edge.get("target_node_id", "")
+                        payload = dict(edge)
+                        payload.update({
+                            "path_node_ids": list(path_node_ids),
+                            "path_confidence": entry.get("path_confidence"),
+                            "path_depth": entry.get("depth"),
+                            "endpoint_node_id": entry.get("endpoint_node_id"),
+                            "anchor_node_id": entry.get("anchor_node_id"),
+                            "path_record": entry,
+                        })
+                        items.append(cls(
+                            evidence_id=f"{eid_prefix}-path-{i}-{j}",
+                            kind="relation", source="query_graph",
+                            edge_type="CALLS",
+                            source_node_id=src_id,
+                            target_node_id=tgt_id,
+                            confidence=edge.get("confidence"),
+                            strategy=edge.get("strategy"),
+                            payload=payload,
+                            complete=True,
+                            tool_name="query_graph",
+                            tool_args=args,
+                            step=step,
+                        ))
+                    continue
+
+                nid = entry.get("id", entry.get("endpoint_node_id", ""))
+                anchor = entry.get("anchor_node_id", symbol)
+                src_id = nid if action == "transitive_callers" else anchor
+                tgt_id = anchor if action == "transitive_callers" else nid
+                if action == "call_paths":
+                    src_id = args.get("source", "")
+                    tgt_id = args.get("target", "")
                 items.append(cls(
                     evidence_id=f"{eid_prefix}-rel-{i}",
                     kind="relation", source="query_graph",
-                    node_id=nid, file=entry.get("file", ""),
+                    file=entry.get("file", ""),
                     edge_type=edge_type,
-                    source_node_id=symbol if edge_type == "CALLS" else nid,
-                    target_node_id=nid if edge_type == "CALLS" else symbol,
-                    confidence=entry.get("confidence"), strategy=entry.get("strategy"),
+                    source_node_id=src_id,
+                    target_node_id=tgt_id,
+                    confidence=entry.get(
+                        "path_confidence",
+                        entry.get("confidence"),
+                    ),
+                    strategy=entry.get("strategy"),
                     payload=entry, complete=True,
                     tool_name="query_graph", tool_args=args, step=step,
                 ))
-
-        if not items:
-            items.append(cls(
-                evidence_id=f"{eid_prefix}-rel-0",
-                kind="relation", source="query_graph",
-                edge_type=edge_type,
-                payload=data, complete=True,
-                tool_name="query_graph", tool_args=args, step=step,
-            ))
         return items
 
     @classmethod
     def _from_class_hierarchy(cls, data, args: dict, step: int, eid_prefix: str) -> list[EvidenceItem]:
         """从类继承层次创建关系证据。"""
         items = []
-        class_name = args.get("class_name", "")
+        requested_class = args.get("class_name", "")
         for i, entry in enumerate(data if isinstance(data, list) else [data]):
             if not isinstance(entry, dict):
                 continue
+            class_node_id = entry.get("class_node_id", requested_class)
             htype = entry.get("type", "?")
             h_items = entry.get("items", [])
             for j, hi in enumerate(h_items):
@@ -449,9 +584,15 @@ class EvidenceItem:
                     kind="relation", source="query_graph",
                     node_id=hi_id,
                     edge_type="INHERITS",
-                    source_node_id=hi_id if htype == "parents" else class_name,
-                    target_node_id=class_name if htype == "parents" else hi_id,
-                    payload={"type": htype, "name": hi_name, "id": hi_id}, complete=True,
+                    source_node_id=class_node_id if htype == "parents" else hi_id,
+                    target_node_id=hi_id if htype == "parents" else class_node_id,
+                    payload={
+                        "type": htype,
+                        "name": hi_name,
+                        "id": hi_id,
+                        "hierarchy_entry": entry,
+                    },
+                    complete=True,
                     tool_name="query_graph", tool_args=args, step=step,
                 ))
         return items
@@ -484,23 +625,46 @@ class EvidenceItem:
     @classmethod
     def _from_read_file(cls, args: dict, raw_result: str, step: int, eid_prefix: str) -> list[EvidenceItem]:
         """从 read_file 结果创建源码证据。"""
+        if raw_result.startswith("[错误]"):
+            return [cls(
+                evidence_id=f"{eid_prefix}-file-error",
+                kind="error",
+                source="read_file",
+                payload=raw_result,
+                tool_name="read_file",
+                tool_args=args,
+                step=step,
+            )]
         path = args.get("path", "")
         sl = args.get("start_line", 0)
         el = args.get("end_line", 0)
+        header = re.match(r"^\[.+ 行 (\d+)-(\d+) / 共 \d+ 行\]", raw_result)
+        if header:
+            sl = int(header.group(1))
+            el = int(header.group(2))
         return [cls(
             evidence_id=f"{eid_prefix}-file-0",
             kind="source", source="read_file",
             file=path, start_line=sl or None, end_line=el or None,
-            payload=raw_result, complete=True,
+            payload={
+                "name": path,
+                "type": "FILE",
+                "file": path,
+                "start_line": sl or None,
+                "end_line": el or None,
+                "source_context": raw_result,
+            },
+            complete=True,
             tool_name="read_file", tool_args=args, step=step,
         )]
 
     @classmethod
     def _from_list_dir(cls, args: dict, raw_result: str, step: int, eid_prefix: str) -> list[EvidenceItem]:
         """从 list_dir 结果创建结构证据。"""
+        kind = "error" if raw_result.startswith("[错误]") else "structure"
         return [cls(
             evidence_id=f"{eid_prefix}-list-0",
-            kind="structure", source="list_dir",
+            kind=kind, source="list_dir",
             payload=raw_result, complete=True,
             tool_name="list_dir", tool_args=args, step=step,
         )]
@@ -520,6 +684,7 @@ class EvidenceLedger:
     """结构化证据账本：去重、分级展示、合成选择、审计输出。"""
 
     SYNTHESIS_CHAR_BUDGET = 12000
+    OBSERVATION_CHAR_BUDGET = 8000
 
     def __init__(self):
         self._items: list[EvidenceItem] = []
@@ -528,12 +693,23 @@ class EvidenceLedger:
 
     # ── 写入 ────────────────────────────────────────────────
 
-    def add(self, item: EvidenceItem) -> str | None:
-        """添加证据项。返回 merged（更新已有项）或 added（新增）或 None（被去重且无新信息）。"""
+    def add(self, item: EvidenceItem) -> str:
+        """添加证据项，返回 merged（更新已有项）或 added（新增）。"""
+        if item.source and item.source not in set(item.sources):
+            item.sources.append(item.source)
+        item._record_tool_origin(item.tool_name, item.tool_args, item.step)
+
         # 错误和控制消息直接放行
         if item.kind in ("error",):
             self._items.append(item)
             return "added"
+
+        # 源码区间需要按重叠关系去重，不能只依赖精确字符串键。
+        overlapping = self._find_overlapping_source(item)
+        if overlapping is not None:
+            self._merge(overlapping, item)
+            self._register_keys(overlapping, item.dedup_keys())
+            return "merged"
 
         # 去重检查
         keys = item.dedup_keys()
@@ -542,27 +718,87 @@ class EvidenceLedger:
             if existing_id is not None:
                 existing = next((e for e in self._items if e.evidence_id == existing_id), None)
                 if existing is not None:
+                    if (
+                        key.startswith("source-range:")
+                        and existing.node_id
+                        and item.node_id
+                        and existing.node_id != item.node_id
+                    ):
+                        continue
                     self._merge(existing, item)
                     return "merged"
 
         # 新证据
         self._items.append(item)
+        self._register_keys(item, keys)
+        return "added"
+
+    def _find_overlapping_source(self, item: EvidenceItem) -> EvidenceItem | None:
+        if (
+            item.kind != "source"
+            or not item.file
+            or item.start_line is None
+            or item.end_line is None
+        ):
+            return None
+        for existing in self._items:
+            if (
+                existing.kind != "source"
+                or existing.file != item.file
+                or existing.start_line is None
+                or existing.end_line is None
+            ):
+                continue
+            if (
+                existing.node_id
+                and item.node_id
+                and existing.node_id != item.node_id
+            ):
+                continue
+            if (
+                item.start_line <= existing.end_line
+                and existing.start_line <= item.end_line
+            ):
+                return existing
+        return None
+
+    def _register_keys(self, item: EvidenceItem, keys: list[str]) -> None:
         for key in keys:
             self._dedup_index[key] = item.evidence_id
-        return "added"
 
     def _merge(self, existing: EvidenceItem, incoming: EvidenceItem) -> None:
         """将 incoming 的信息合并到 existing（保留更完整的 payload）。"""
-        # 合并来源信息
-        if existing.complete and not incoming.complete:
-            return  # 已有完整数据，无需合并
+        source_set = set(existing.sources)
+        for source in incoming.sources or [incoming.source]:
+            if source and source not in source_set:
+                existing.sources.append(source)
+                source_set.add(source)
+        for origin in incoming.tool_origins:
+            existing._record_tool_origin(
+                origin.get("tool_name", ""),
+                origin.get("tool_args", {}),
+                origin.get("step", incoming.step),
+            )
+
         if not existing.complete and incoming.complete:
-            # 用完整数据替换
             existing.payload = incoming.payload
             existing.complete = True
-            existing.file = incoming.file or existing.file
-            existing.start_line = incoming.start_line or existing.start_line
-            existing.end_line = incoming.end_line or existing.end_line
+        elif existing.complete == incoming.complete:
+            existing.payload = self._merge_payload(existing.payload, incoming.payload)
+
+        existing.file = incoming.file or existing.file
+        starts = [
+            line for line in (existing.start_line, incoming.start_line)
+            if line is not None
+        ]
+        ends = [
+            line for line in (existing.end_line, incoming.end_line)
+            if line is not None
+        ]
+        if starts:
+            existing.start_line = min(starts)
+        if ends:
+            existing.end_line = max(ends)
         # 补充元数据
         if incoming.confidence is not None and existing.confidence is None:
             existing.confidence = incoming.confidence
@@ -572,6 +808,56 @@ class EvidenceLedger:
         for key in incoming.dedup_keys():
             if key not in self._dedup_index:
                 self._dedup_index[key] = existing.evidence_id
+
+    @classmethod
+    def _merge_payload(cls, existing, incoming):
+        if existing == incoming:
+            return existing
+        if isinstance(existing, dict) and isinstance(incoming, dict):
+            merged = dict(existing)
+            for key, value in incoming.items():
+                if key not in merged or merged[key] in ("", None, [], {}):
+                    merged[key] = value
+                elif isinstance(merged[key], list) and isinstance(value, list):
+                    merged[key] = cls._merge_lists(merged[key], value)
+                elif key == "source_context" and isinstance(merged[key], str) and isinstance(value, str):
+                    merged[key] = cls._merge_source_text(merged[key], value)
+            return merged
+        existing_text = str(existing)
+        incoming_text = str(incoming)
+        return incoming if len(incoming_text) > len(existing_text) else existing
+
+    @staticmethod
+    def _merge_lists(existing: list, incoming: list) -> list:
+        merged = list(existing)
+        known = {
+            json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            for item in existing
+        }
+        for item in incoming:
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            if key not in known:
+                merged.append(item)
+                known.add(key)
+        return merged
+
+    @staticmethod
+    def _merge_source_text(existing: str, incoming: str) -> str:
+        line_pattern = re.compile(r"^\s*(\d+)\|")
+        numbered: dict[int, str] = {}
+        unnumbered = []
+        unnumbered_seen = set()
+        for text in (existing, incoming):
+            for line in text.splitlines():
+                match = line_pattern.match(line)
+                if match:
+                    numbered[int(match.group(1))] = line
+                elif line not in unnumbered_seen:
+                    unnumbered.append(line)
+                    unnumbered_seen.add(line)
+        if numbered:
+            return "\n".join(unnumbered + [numbered[n] for n in sorted(numbered)])
+        return incoming if len(incoming) > len(existing) else existing
 
     # ── 读取 ────────────────────────────────────────────────
 
@@ -586,6 +872,13 @@ class EvidenceLedger:
     def relation_items(self) -> list[EvidenceItem]:
         return [e for e in self._items if e.kind == "relation"]
 
+    @property
+    def has_synthesis_evidence(self) -> bool:
+        return any(
+            item.kind in {"source", "relation", "candidate"}
+            for item in self._items
+        )
+
     # ── 合成选择 ────────────────────────────────────────────
 
     def select_for_synthesis(self, char_budget: int | None = None) -> list[EvidenceItem]:
@@ -597,11 +890,27 @@ class EvidenceLedger:
         3. 超出预算时先降级非 source 项，再减少项数
         4. 不在单个证据中间截断
         """
-        budget = char_budget or self.SYNTHESIS_CHAR_BUDGET
+        budget = (
+            self.SYNTHESIS_CHAR_BUDGET
+            if char_budget is None
+            else char_budget
+        )
         self._selections = []
 
-        eligible = [e for e in self._items if e.kind in ("source", "relation", "candidate")]
+        eligible_kinds = {"source", "relation", "candidate"}
+        eligible = [e for e in self._items if e.kind in eligible_kinds]
+        ineligible = [e for e in self._items if e.kind not in eligible_kinds]
         if not eligible:
+            self._selections.extend(
+                _SelectionEntry(
+                    item=item,
+                    level=DisplayLevel.FOLD,
+                    char_count=0,
+                    selected=False,
+                    excluded_reason="类型不参与答案合成",
+                )
+                for item in ineligible
+            )
             return []
 
         # 优先级排序：source > relation > candidate
@@ -621,6 +930,16 @@ class EvidenceLedger:
             ))
             selected.append(item)
             total_chars += char_count
+        self._selections.extend(
+            _SelectionEntry(
+                item=item,
+                level=DisplayLevel.FOLD,
+                char_count=0,
+                selected=False,
+                excluded_reason="类型不参与答案合成",
+            )
+            for item in ineligible
+        )
 
         # 第二遍：超出预算时降级
         if total_chars > budget:
@@ -681,32 +1000,6 @@ class EvidenceLedger:
             if not excluded_one:
                 break
 
-        # 第五遍：仍超出，对 source 项降级（COMPLETE → SNIPPET → FOLD）
-        if total_chars > budget:
-            for sel in self._selections:
-                if not sel.selected or sel.item.kind != "source":
-                    continue
-                if sel.level == DisplayLevel.COMPLETE:
-                    preview_text = sel.item.render(DisplayLevel.SNIPPET)
-                    delta = sel.char_count - len(preview_text)
-                    sel.level = DisplayLevel.SNIPPET
-                    sel.char_count = len(preview_text)
-                    total_chars -= delta
-                    if total_chars <= budget:
-                        break
-        if total_chars > budget:
-            for sel in self._selections:
-                if not sel.selected or sel.item.kind != "source":
-                    continue
-                if sel.level == DisplayLevel.SNIPPET:
-                    fold_text = sel.item.render(DisplayLevel.FOLD)
-                    delta = sel.char_count - len(fold_text)
-                    sel.level = DisplayLevel.FOLD
-                    sel.char_count = len(fold_text)
-                    total_chars -= delta
-                    if total_chars <= budget:
-                        break
-
         selected = [s.item for s in self._selections if s.selected]
         return selected
 
@@ -726,7 +1019,9 @@ class EvidenceLedger:
             )
             if sel.selected:
                 total_chars += sel.char_count
+        estimated_tokens = (total_chars + 3) // 4
         lines.append(f"总字符数: {total_chars}")
+        lines.append(f"估算 token 数: {estimated_tokens}")
         return "\n".join(lines)
 
     # ── 渲染 ────────────────────────────────────────────────
@@ -741,6 +1036,49 @@ class EvidenceLedger:
         for item in items:
             texts.append(item.render(level))
         return separator.join(texts)
+
+    def render_for_observation(
+        self,
+        items: list[EvidenceItem],
+        char_budget: int | None = None,
+        separator: str = "\n---\n",
+    ) -> str:
+        """按工具观察预算渲染，不修改账本中的完整 payload。"""
+        budget = (
+            self.OBSERVATION_CHAR_BUDGET
+            if char_budget is None
+            else char_budget
+        )
+        rendered = []
+        used = 0
+        has_source_summary = any(item.kind == "source" for item in items)
+        for item in items:
+            if has_source_summary and item.kind == "relation":
+                continue
+            if item.kind == "source":
+                levels = [
+                    DisplayLevel.PREVIEW,
+                    DisplayLevel.SNIPPET,
+                    DisplayLevel.FOLD,
+                ]
+            elif item.kind == "candidate":
+                levels = [DisplayLevel.FOLD]
+            elif item.kind == "relation":
+                levels = [DisplayLevel.PREVIEW, DisplayLevel.FOLD]
+            else:
+                levels = [DisplayLevel.COMPLETE, DisplayLevel.FOLD]
+
+            text = ""
+            for level in levels:
+                candidate = item.render(level)
+                if used + len(candidate) <= budget:
+                    text = candidate
+                    break
+            if not text:
+                continue
+            rendered.append(text)
+            used += len(text)
+        return separator.join(rendered)
 
     def render_selected_for_synthesis(self, separator: str = "\n---\n") -> str:
         """按 select_for_synthesis() 决定的逐项展示等级渲染证据。
@@ -764,6 +1102,17 @@ class EvidenceLedger:
             lines.append(f"[{i+1}] {item.evidence_id}")
             lines.append(f"  kind: {item.kind}")
             lines.append(f"  source: {item.source} (step {item.step})")
+            if item.retrieval_stage:
+                lines.append(f"  retrieval_stage: {item.retrieval_stage}")
+            lines.append(f"  sources: {', '.join(item.sources)}")
+            lines.append(
+                "  tool_origins: "
+                + json.dumps(
+                    item.tool_origins,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
             if item.node_id:
                 lines.append(f"  node_id: {item.node_id}")
             if item.file:
