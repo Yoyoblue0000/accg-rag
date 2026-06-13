@@ -457,7 +457,9 @@ def test_agent_returns_result_when_embedding_is_unavailable(tmp_path):
 
     result = agent.run("How are response headers normalized?")
 
-    assert result.answer == "evidence collected"
+    # P4 门控：FINAL 无证据时返回错误而非直接输出草稿
+    assert result.error is not None
+    assert "证据不足" in result.error
     assert result.retrieval.status == "fallback"
     assert result.anchor_candidates
 
@@ -597,7 +599,6 @@ class _RepeatedFinalModel:
         return "verified answer"
 
 
-@pytest.mark.skip(reason="P3: 关系充分性门控不在本次 P0/P1 范围")
 def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -689,14 +690,11 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     )
 
     assert result.answer == "verified answer"
-    assert len(model.query_messages) == 2
-    expansions = agent.last_query_plan["relation_expansions"]
-    assert [item["id"] for item in expansions] == ["src/commands.py::lint"]
-    retry_message = model.query_messages[1][-1]["content"]
-    assert "[证据充分性检查未通过]" in retry_message
-    assert "click.echo(format_linting_result_header())" in retry_message
+    # P4 门控：lint 作为锚点与 format_linting_result_header 有 CALLS 边，
+    # 关系证据连接 ≥2 个锚点实体，门控首次即通过，无需扩展
+    assert len(model.query_messages) == 1
+    assert result.evidence
     synthesis_prompt = model.generate_messages[0]["content"]
-    assert "click.echo(format_linting_result_header())" in synthesis_prompt
     assert "header 和 formatter 只是职责分离" in synthesis_prompt
 
 

@@ -12,6 +12,12 @@ from .environment import Environment
 from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
 from .query_plan import Anchor, QueryPlan
 from .retrieval import RetrievalResult
+from .sufficiency import (
+    FinishAction,
+    GateDecision,
+    ExpansionRequest,
+    SufficiencyGate,
+)
 from accg.models import NodeId
 
 
@@ -221,6 +227,9 @@ class Agent:
         self.last_model_requests: list[dict] = []
         self._full_tool_results: dict[str, str] = {}
         self.last_query_plan: dict = {}
+        self._gate = SufficiencyGate()
+        self._expansion_count = 0
+        self._expanded_relations: set[str] = set()
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -288,6 +297,8 @@ class Agent:
         self.last_model_requests.clear()
         self._full_tool_results.clear()
         self.last_query_plan = {}
+        self._expansion_count = 0
+        self._expanded_relations.clear()
         graph_status = ""
         if self.graph_tool:
             try:
@@ -533,60 +544,83 @@ class Agent:
             raw_content = response.get("raw_content", "")
             finish_reason = response.get("finish_reason")
 
-            # FINAL 文本标记（用户显式指令，最高优先级）
-            final_text = _extract_final(raw_content)
-            if final_text:
+            # 模型完成信号检测
+            finish_action = FinishAction.from_content(raw_content)
+            has_tools = bool(response["tool_calls"])
+            model_done = (
+                finish_action is not None
+                or (finish_reason == "stop" and not has_tools)
+                or (not has_tools and self._ledger.has_synthesis_evidence)
+            )
+
+            if model_done:
+                draft = (
+                    finish_action.draft if finish_action
+                    else (thought if thought else "")
+                )
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
-                # 有证据 → 合成；无证据 → 直接用 FINAL 文本
-                if self._ledger.has_synthesis_evidence:
-                    return self._synthesize(task, candidates, draft=final_text)
-                return RunResult(
-                    answer=final_text,
-                    anchor_candidates=candidates,
-                    retrieval=self._retrieval_result,
-                    messages=list(self._trace),
-                    query_plan=copy.deepcopy(self.last_query_plan),
+
+                # 证据充分性门控
+                gate_decision = self._gate.evaluate(
+                    question=task,
+                    query_plan=self.last_query_plan,
+                    evidence_items=self._ledger.items(),
+                    draft=draft,
+                    expansion_count=self._expansion_count,
+                    expanded_relations=self._expanded_relations,
                 )
 
-            # API 原生停牌信号（借鉴 OpenCode：finish_reason="stop" 即模型完成）
-            if finish_reason == "stop" and not response["tool_calls"]:
-                self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
-                self.messages.append({"role": "assistant", "content": thought})
-                # 有证据 → 合成；无证据 → 直接用 thought
-                if self._ledger.has_synthesis_evidence:
-                    return self._synthesize(task, candidates, draft=thought)
-                if thought:
-                    return RunResult(
-                        answer=thought,
-                        anchor_candidates=candidates,
-                        retrieval=self._retrieval_result,
-                        messages=list(self._trace),
-                        query_plan=copy.deepcopy(self.last_query_plan),
+                if gate_decision.passed:
+                    return self._synthesize(task, candidates, draft=draft)
+
+                # 门控未通过 —— 尝试受控扩展
+                if (
+                    gate_decision.expansion_requests
+                    and self._expansion_count < SufficiencyGate.MAX_AUTO_EXPANSIONS
+                ):
+                    self._execute_expansions(
+                        gate_decision.expansion_requests,
+                        query_plan,
+                    )
+                    self._expansion_count += 1
+
+                    # 压缩旧工具结果，保留最近轮次
+                    self._compress_messages(keep_recent_turns=3)
+
+                    # 通知模型证据不足，包含新增证据
+                    gate_msg = self._format_gate_failure_message(
+                        gate_decision, draft
+                    )
+                    self.messages.append({
+                        "role": "user",
+                        "content": gate_msg,
+                    })
+                    self._emit(MsgRecord(
+                        role="user", content=gate_msg,
+                        step=self.step_count,
+                    ))
+                    continue
+
+                # 无扩展可用 —— 返回错误
+                error_msg = "证据不足: " + "; ".join(
+                    gate_decision.missing_requirements
+                )
+                if finish_action and finish_action.draft:
+                    error_msg = (
+                        f"[门控未通过] {error_msg}。"
+                        f"模型草稿: {finish_action.draft[:200]}"
                     )
                 return RunResult(
-                    answer="[模型未生成有效输出]",
+                    answer="",
+                    error=error_msg,
                     anchor_candidates=candidates,
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
                     query_plan=copy.deepcopy(self.last_query_plan),
                 )
 
-            # 无工具调用（finish_reason 可能为 "length" / None）
-            if not response["tool_calls"]:
-                self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
-                self.messages.append({"role": "assistant", "content": thought})
-                if self._ledger.has_synthesis_evidence:
-                    return self._synthesize(task, candidates, draft=thought)
-                return RunResult(
-                    answer=thought,
-                    anchor_candidates=candidates,
-                    retrieval=self._retrieval_result,
-                    messages=list(self._trace),
-                    query_plan=copy.deepcopy(self.last_query_plan),
-                )
-
-            # 有工具调用
+            # 有工具调用 —— 正常探索
             self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
             self.messages.append({
                 "role": "assistant",
@@ -671,6 +705,153 @@ class Agent:
             messages=list(self._trace),
             query_plan=copy.deepcopy(self.last_query_plan),
         )
+
+    def _execute_expansions(
+        self,
+        requests: list[ExpansionRequest],
+        query_plan: QueryPlan,
+    ) -> None:
+        """执行受控关系扩展：遍历 → 写入账本 → 记录到 query_plan。"""
+        if not self.graph_tool:
+            return
+        for req in requests:
+            try:
+                if req.action == "contextualize":
+                    raw = self.graph_tool.execute_full(
+                        "contextualize",
+                        name=req.symbol,
+                        limit=1,
+                    )
+                elif req.action in (
+                    "transitive_callers", "transitive_callees",
+                    "call_paths",
+                ):
+                    kwargs: dict = {"symbol": req.symbol}
+                    if req.action == "call_paths" and req.target:
+                        kwargs["source"] = req.symbol
+                        kwargs["target"] = req.target
+                    raw = self.graph_tool.execute_full(req.action, **kwargs)
+                elif req.action == "class_hierarchy":
+                    raw = self.graph_tool.execute_full(
+                        "class_hierarchy",
+                        class_name=req.symbol,
+                    )
+                else:
+                    continue
+
+                tool_args = {"action": req.action}
+                if req.action == "class_hierarchy":
+                    tool_args["class_name"] = req.symbol
+                elif req.action == "contextualize":
+                    tool_args["name"] = req.symbol
+                else:
+                    tool_args["symbol"] = req.symbol
+                items = EvidenceItem.from_tool_result(
+                    "query_graph",
+                    tool_args,
+                    raw,
+                    step=self.step_count,
+                )
+                new_ids = []
+                for ei in items:
+                    result = self._ledger.add(ei)
+                    if result in ("added", "merged"):
+                        new_ids.append(ei.evidence_id)
+
+                # 记录已扩展，防止重复
+                self._expanded_relations.add(
+                    f"{req.action}:{req.symbol}"
+                )
+
+                query_plan.relation_expansions.append({
+                    "reason": req.reason,
+                    "action": req.action,
+                    "symbol": req.symbol,
+                    "target": req.target,
+                    "max_depth": req.max_depth,
+                    "evidence_ids": new_ids,
+                    "step": self.step_count,
+                })
+            except Exception as exc:
+                query_plan.diagnostics.append(
+                    f"扩展失败 [{req.action} {req.symbol}]: {exc}"
+                )
+
+    def _compress_messages(self, keep_recent_turns: int = 2) -> None:
+        """压缩消息历史：旧工具结果替换为证据 ID 摘要，保留最近 N 轮。
+
+        移除被门控拒绝的 FINAL 消息，确保模型不会看到自己被驳回的结论。
+        审计仍保存完整原始请求。
+        """
+        if len(self.messages) <= keep_recent_turns * 2 + 2:
+            return
+
+        all_evidence_ids = [
+            item.evidence_id for item in self._ledger.items()
+        ]
+        if not all_evidence_ids:
+            return
+
+        # 找到最后一条 assistant 消息（被门控拒绝的 FINAL）
+        # 以及它之前的 tool 消息，全部移除
+        last_idx = len(self.messages) - 1
+        while last_idx >= 2:
+            role = self.messages[last_idx].get("role", "")
+            if role == "assistant":
+                break
+            last_idx -= 1
+
+        # 保留: system + user（前 2 条）+ 最近 keep_recent_turns 轮
+        # 但要移除被拒绝的 FINAL assistant 消息
+        keep_start = max(2, last_idx - keep_recent_turns * 2)
+        # 不保留被拒绝的 FINAL 本身（它在 last_idx）
+        keep_end = min(last_idx, len(self.messages))
+
+        # 重建消息列表
+        new_messages = list(self.messages[:2])  # system + user
+        new_messages.append({
+            "role": "user",
+            "content": (
+                f"[证据摘要] 前面探索已收集 {len(all_evidence_ids)} 条证据，"
+                "完整数据在证据账本中。"
+                "你可以继续用工具探索更多证据，"
+                "或输出 FINAL: <答案>。"
+            ),
+        })
+        # 保留 last_idx 之前的最近几轮（不包含被拒 FINAL）
+        if keep_start < keep_end:
+            new_messages.extend(self.messages[keep_start:keep_end])
+
+        self.messages = new_messages
+
+    @staticmethod
+    def _format_gate_failure_message(
+        decision: GateDecision,
+        draft: str,
+    ) -> str:
+        """构建门控未通过的通知消息，附加新证据提示。"""
+        parts = [
+            "[证据充分性检查未通过]",
+            "",
+            f"缺失项: {'; '.join(decision.missing_requirements)}",
+        ]
+        if decision.expansion_requests:
+            parts.append(
+                f"已自动扩展 {len(decision.expansion_requests)} 个关系，"
+                "新增证据已写入账本，请重新评估证据是否充分。"
+            )
+        if draft:
+            parts.append(
+                f"\n你之前的草稿（参考，可修改）:\n{draft[:500]}"
+            )
+        parts.append(
+            "\n## 请继续\n"
+            "如果证据仍不足，请用标准格式继续探索：\n"
+            "THOUGHT: <还需要什么证据>\n"
+            "ACTION: {\"name\": \"<工具>\", \"arguments\": {...}}\n\n"
+            "如果证据已足够，请输出: FINAL: <最终答案>"
+        )
+        return "\n".join(parts)
 
     @staticmethod
     def _check_convergence(raw_json: str) -> str | None:

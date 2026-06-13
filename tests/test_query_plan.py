@@ -305,7 +305,9 @@ def test_invalid_node_id_is_rejected_and_next_anchor_is_prefetched(tmp_path):
         "Compare src/missing.py::missing_handler with ValidService."
     )
 
-    assert result.answer == "verified"
+    # P4 门控：比较问题只有 1 个有效锚点，证据不足
+    assert result.error is not None
+    assert "证据不足" in result.error
     assert [item["id"] for item in agent.last_query_plan["anchors"]] == [
         "src/valid.py::ValidService",
     ]
