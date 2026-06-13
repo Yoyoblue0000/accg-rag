@@ -228,6 +228,7 @@ class Agent:
         answer_model=None,
         on_step: Callable[["MsgRecord"], None] | None = None,
         on_audit: Callable[[str], None] | None = None,
+        reranker=None,
     ):
         self.model = model
         self.env = env
@@ -250,6 +251,7 @@ class Agent:
         self._expansion_count = 0
         self._expanded_relations: set[str] = set()
         self._latest_finish_draft = ""
+        self._reranker = reranker
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -370,6 +372,31 @@ class Agent:
                 )
                 query_plan.diagnostics.append(f"候选检索失败: {e}")
             if candidates:
+                # ── 在线重排 ──
+                rerank_info = None
+                if self._reranker is not None:
+                    try:
+                        rerank_result = self._reranker.rerank(task, candidates)
+                        rerank_info = {
+                            "relevant_ids": rerank_result.ranked_ids,
+                            "reasoning": rerank_result.reasoning,
+                            "elapsed_ms": round(rerank_result.elapsed_ms, 1),
+                            "error": rerank_result.error,
+                        }
+                        query_plan.diagnostics.append(
+                            f"重排完成: {len(rerank_result.ranked_ids)} 个相关候选 "
+                            f"({rerank_result.elapsed_ms:.0f}ms)"
+                            + (f", 原因: {rerank_result.reasoning}" if rerank_result.reasoning else "")
+                        )
+                        if rerank_result.passed:
+                            # 将重排后的候选列表用于后续锚点选择
+                            candidates = self._reranker.apply(task, candidates)
+                    except Exception as e:
+                        rerank_info = {"error": str(e)}
+                        query_plan.diagnostics.append(f"重排失败: {e}")
+                if rerank_info:
+                    query_plan.rerank = rerank_info
+
                 items = []
                 for c in candidates[:self.CANDIDATE_DISPLAY_LIMIT]:
                     sources = ",".join(c.get("sources", []))
@@ -378,6 +405,21 @@ class Agent:
                         f"[score={c['score']:.2f}; sources={sources}]"
                     )
                 prelude = "\n\n[候选符号] 以下与问题语义最相关:\n" + "\n".join(items)
+                if rerank_info and rerank_info.get("relevant_ids"):
+                    prelude += (
+                        "\n\n[重排] 小模型认为最相关的 5 个候选: "
+                        + ", ".join(
+                            next(
+                                (
+                                    c.get("name", cid)
+                                    for c in candidates[:24]
+                                    if c.get("id") == cid
+                                ),
+                                cid,
+                            )
+                            for cid in rerank_info["relevant_ids"][:5]
+                        )
+                    )
 
                 ordered_anchors = self.graph_tool.select_query_anchors(
                     task,

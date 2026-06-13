@@ -248,6 +248,19 @@ class GraphTool:
 
         return f"图构建完成: {node_count} 个节点, {edge_count} 条边"
 
+    def _load_summary_index(self) -> dict[str, str]:
+        """加载离线摘要索引（.accg/summary_index.json），不存在则返回空。"""
+        idx_path = self.project_path / ".accg" / "summary_index.json"
+        if not idx_path.is_file():
+            return {}
+        try:
+            data = json.loads(idx_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+        return {}
+
     @property
     def is_ready(self) -> bool:
         return self._built
@@ -680,8 +693,9 @@ class GraphTool:
                 duration_ms=(time.perf_counter() - started_at) * 1000,
             )
         if self._candidate_retriever is None:
+            summaries = self._load_summary_index()
             self._candidate_retriever = CandidateRetriever(
-                build_entries(self._graph)
+                build_entries(self._graph, summaries)
             )
 
         embedding_candidates = None

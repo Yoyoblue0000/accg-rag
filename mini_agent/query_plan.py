@@ -58,6 +58,7 @@ class QueryPlan:
     prefetch_evidence_ids: list[str] = field(default_factory=list)
     relation_expansions: list[dict] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+    rerank: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -71,4 +72,5 @@ class QueryPlan:
             "prefetch_evidence_ids": list(self.prefetch_evidence_ids),
             "relation_expansions": list(self.relation_expansions),
             "diagnostics": list(self.diagnostics),
+            "rerank": self.rerank,
         }

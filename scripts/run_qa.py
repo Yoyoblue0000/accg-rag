@@ -11,6 +11,7 @@ from mini_agent.model import Model, ModelConfig
 from mini_agent.environment import Environment, EnvConfig
 from mini_agent.agent import Agent, RunResult, MsgRecord
 from mini_agent.graph_tool import GraphTool
+from mini_agent.reranker import Reranker
 from mini_agent.retrieval_metrics import (
     aggregate_retrieval_metrics,
     evaluate_anchors,
@@ -195,6 +196,11 @@ def main():
         action="store_true",
         help="禁用 embedding（兼容旧命令，当前已是默认行为）",
     )
+    parser.add_argument(
+        "--reranker-model",
+        default=os.environ.get("RERANKER_MODEL", ""),
+        help="重排小模型名（如 qwen2.5:7b），留空则不启用重排",
+    )
     args = parser.parse_args()
 
     verbosity = min(args.verbose, 2)
@@ -212,6 +218,16 @@ def main():
         args.project_path,
         enable_embeddings=args.embedding and not args.no_embedding,
     )
+
+    reranker = None
+    if args.reranker_model:
+        reranker_model = Model(ModelConfig(
+            base_url=args.base_url,
+            api_key="ollama",
+            model_name=args.reranker_model,
+            quiet=True,
+        ))
+        reranker = Reranker(reranker_model, project_root=args.project_path)
 
     qa_path = Path(args.qa_path)
     if not qa_path.is_file():
@@ -292,6 +308,7 @@ def main():
                 max_steps=12,
                 on_step=_on_step,
                 on_audit=print if verbosity >= 2 else None,
+                reranker=reranker,
             )
             result = agent.run(question)
 
@@ -356,6 +373,7 @@ def main():
                 }
                 for anchor in query_plan_payload["anchors"]
             ],
+            "rerank": query_plan_payload.get("rerank"),
         })
         out_path.write_text(
             json.dumps(artifact_records, ensure_ascii=False, indent=2),

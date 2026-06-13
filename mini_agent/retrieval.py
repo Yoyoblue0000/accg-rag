@@ -27,6 +27,7 @@ _FIELD_BOOSTS = {
     "signature": 2.0,
     "docstring": 1.0,
     "decorator": 2.5,
+    "summary": 5.0,       # 离线 7B 摘要，高质量语义信号
 }
 
 _STOP_WORDS = {
@@ -148,7 +149,10 @@ def _category_multiplier(entry: _Entry, query: str) -> float:
     return 0.55 if entry.category == "test" else 0.7
 
 
-def build_entries(graph) -> list[_Entry]:
+def build_entries(graph, summaries: dict[str, str] | None = None) -> list[_Entry]:
+    """从图中构建检索条目，可选注入离线摘要。"""
+    if summaries is None:
+        summaries = {}
     entries: list[_Entry] = []
     for node_id, data in graph.nodes(data=True):
         node_type = data.get("node_type")
@@ -193,6 +197,7 @@ def build_entries(graph) -> list[_Entry]:
             "signature": str(data.get("signature", "")),
             "docstring": str(data.get("docstring", "")),
             "decorator": decorator_text,
+            "summary": summaries.get(str(node_id), ""),
         }
         entries.append(_Entry(
             id=str(node_id),
