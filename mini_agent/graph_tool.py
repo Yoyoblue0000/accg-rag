@@ -62,10 +62,11 @@ class EmbeddingRanker:
         base_url: str = "http://localhost:11434/v1",
         cache_dir: str | None = None,
         timeout: float = 3.0,
+        model: str = "nomic-embed-text",
     ):
         self._client = None
         self._base_url = base_url
-        self._model = "nomic-embed-text"
+        self._model = model
         self._embeddings: list[tuple[dict, list[float]]] | None = None  # [(node, vec)]
         self._cache_dir = Path(cache_dir) if cache_dir else None
         self._timeout = timeout
@@ -90,8 +91,8 @@ class EmbeddingRanker:
             logger.warning("EmbeddingRanker: 无法初始化客户端 (%s)", e)
             return False
 
-    def _fingerprint(self, entries: list[dict]) -> str:
-        """基于符号列表生成指纹，代码变化则指纹变化"""
+    def _fingerprint(self, entries: list[dict], summaries: dict[str, str] | None = None) -> str:
+        """基于符号列表和摘要生成指纹，代码或摘要变化则指纹变化。"""
         raw = json.dumps(
             [
                 (
@@ -102,6 +103,7 @@ class EmbeddingRanker:
                     e.get("docstring", ""),
                     e.get("parent", ""),
                     e.get("decorators", []),
+                    (summaries or {}).get(e["id"], ""),
                 )
                 for e in entries
             ],
@@ -114,12 +116,18 @@ class EmbeddingRanker:
             return None
         return self._cache_dir / f"embeddings_{self._model.replace('/', '_')}.pkl"
 
-    def build_index(self, graph) -> None:
-        """预计算全图节点的 embedding（批量），优先从磁盘缓存加载"""
+    def build_index(self, graph, summaries: dict[str, str] | None = None) -> None:
+        """预计算全图节点的 embedding（批量），优先从磁盘缓存加载。
+
+        如果有离线摘要，用摘要文本做 embedding（语义更精准）；
+        否则回退到 name+sig+docstring 拼接。
+        """
         if self._embeddings is not None:
             return
         if not self._ensure_client():
             raise RuntimeError(self._failed_reason or "embedding 客户端不可用")
+        if summaries is None:
+            summaries = {}
 
         # 收集符号条目
         entries = []
@@ -150,7 +158,13 @@ class EmbeddingRanker:
                 "decorators": decorators,
             }
             entries.append(node)
-            texts.append(_build_embed_text(node))
+            # 摘要文本拼接到原有 embedding 文本后面（不替换）
+            summary = summaries.get(str(nid), "")
+            base_text = _build_embed_text(node)
+            if summary:
+                texts.append(f"{base_text} | {summary}")
+            else:
+                texts.append(base_text)
 
         if not entries:
             return
@@ -158,7 +172,7 @@ class EmbeddingRanker:
         # 尝试从缓存加载
         cache_path = self._cache_path()
         if cache_path is not None:
-            fp = self._fingerprint(entries)
+            fp = self._fingerprint(entries, summaries)
             try:
                 cached = pickle.loads(cache_path.read_bytes())
                 if cached.get("version") == self._CACHE_VERSION and cached.get("fingerprint") == fp:
@@ -222,9 +236,11 @@ class EmbeddingRanker:
 class GraphTool:
     """加载 ACCG 图并提供结构化查询。"""
 
-    def __init__(self, project_path: str, enable_embeddings: bool = False):
+    def __init__(self, project_path: str, enable_embeddings: bool = False,
+                 embedding_model: str = "nomic-embed-text"):
         self.project_path = Path(project_path)
         self.enable_embeddings = enable_embeddings
+        self._embedding_model = embedding_model
         self._graph = None
         self._query = None
         self._built = False
@@ -708,7 +724,8 @@ class GraphTool:
             else:
                 try:
                     self._ensure_embedding_ranker()
-                    self.embedding_ranker.build_index(self._graph)
+                    summaries = self._load_summary_index()
+                    self.embedding_ranker.build_index(self._graph, summaries)
                     embedding_candidates = self.embedding_ranker.rank(
                         text,
                         limit=limit,
@@ -912,7 +929,10 @@ class GraphTool:
     def _ensure_embedding_ranker(self):
         if self.embedding_ranker is None:
             cache_dir = str(self.project_path / ".accg")
-            self.embedding_ranker = EmbeddingRanker(cache_dir=cache_dir)
+            self.embedding_ranker = EmbeddingRanker(
+                cache_dir=cache_dir,
+                model=self._embedding_model,
+            )
 
     # ── extract_clues（独立工具） ────────────────────────
 

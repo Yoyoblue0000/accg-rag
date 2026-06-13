@@ -324,7 +324,7 @@ class CandidateRetriever:
                     self._merge(
                         merged,
                         entry,
-                        20.0 + score * 20.0,
+                        80.0 + score * 80.0,
                         "embedding",
                         [],
                         [],
