@@ -147,6 +147,58 @@ def evaluate_candidates(
     return metrics
 
 
+def evaluate_anchors(
+    anchors: list,
+    gold: GoldLocations,
+    query: str,
+) -> dict:
+    """计算锚点精确率、召回率与问题显式类型覆盖率。"""
+    matched_by_anchor = [
+        _matched_gold(anchor, gold)
+        for anchor in anchors
+    ]
+    matched_gold = (
+        set().union(*matched_by_anchor)
+        if matched_by_anchor
+        else set()
+    )
+    relevant_count = sum(bool(matches) for matches in matched_by_anchor)
+
+    query_text = query.casefold()
+    requested_types = set()
+    for keyword, node_type in (
+        ("function", "FUNCTION"),
+        ("class", "CLASS"),
+        ("method", "METHOD"),
+    ):
+        if re.search(rf"\b{keyword}s?\b", query_text):
+            requested_types.add(node_type)
+    covered_types = {
+        str(_candidate_value(anchor, "type", ""))
+        for anchor in anchors
+    } & requested_types
+
+    return {
+        "evaluable": gold.count > 0,
+        "anchor_count": len(anchors),
+        "matched_anchor_count": relevant_count,
+        "anchor_precision": round(
+            relevant_count / len(anchors),
+            6,
+        ) if anchors else 0.0,
+        "anchor_recall": round(
+            len(matched_gold) / gold.count,
+            6,
+        ) if gold.count else 0.0,
+        "requested_types": sorted(requested_types),
+        "covered_types": sorted(covered_types),
+        "type_coverage": round(
+            len(covered_types) / len(requested_types),
+            6,
+        ) if requested_types else 1.0,
+    }
+
+
 def aggregate_retrieval_metrics(records: list[dict]) -> dict:
     """聚合 QA 记录中的检索指标与降级计数。"""
     evaluable = [
@@ -196,6 +248,23 @@ def aggregate_retrieval_metrics(records: list[dict]) -> dict:
         values = [
             record["retrieval_metrics"][metric_name]
             for record in evaluable
+        ]
+        summary[metric_name] = (
+            round(sum(values) / len(values), 6) if values else 0.0
+        )
+    anchor_records = [
+        record["anchor_metrics"]
+        for record in records
+        if record.get("anchor_metrics", {}).get("evaluable")
+    ]
+    for metric_name in (
+        "anchor_precision",
+        "anchor_recall",
+        "type_coverage",
+    ):
+        values = [
+            record[metric_name]
+            for record in anchor_records
         ]
         summary[metric_name] = (
             round(sum(values) / len(values), 6) if values else 0.0

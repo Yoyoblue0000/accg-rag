@@ -462,7 +462,64 @@ def test_agent_returns_result_when_embedding_is_unavailable(tmp_path):
     assert result.anchor_candidates
 
 
-@pytest.mark.skip(reason="P2: 自动锚点预取不在本次 P0/P1 范围")
+def test_agent_retrieves_deep_candidate_pool_but_displays_top_eight(tmp_path):
+    class _Retrieval:
+        def __init__(self):
+            self.candidates = [
+                type(
+                    "_Candidate",
+                    (),
+                    {
+                        "to_dict": lambda self, index=index: {
+                            "id": f"node-{index}",
+                            "name": f"candidate_{index}",
+                            "type": "FUNCTION",
+                            "file": f"src/{index}.py",
+                            "score": float(100 - index),
+                            "sources": ["lexical"],
+                            "matched_terms": [],
+                            "matched_fields": [],
+                        },
+                    },
+                )()
+                for index in range(24)
+            ]
+            self.diagnostics = []
+            self.duration_ms = 0.0
+
+    class _PoolGraphTool:
+        is_ready = True
+        enable_embeddings = False
+
+        def __init__(self):
+            self.requested_limit = None
+
+        def ensure_built(self):
+            return "ready"
+
+        def search(self, query, limit=12, use_embeddings=None):
+            self.requested_limit = limit
+            return _Retrieval()
+
+        def select_query_anchors(self, query, candidates, max_anchors=3):
+            return []
+
+    tool = _PoolGraphTool()
+    model = _FinalModel()
+    agent = Agent(
+        model,
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=tool,
+    )
+
+    agent.run("Explain candidate retrieval.")
+
+    assert tool.requested_limit >= 24
+    user_message = model.last_messages[1]["content"]
+    assert "candidate_7" in user_message
+    assert "candidate_8" not in user_message
+
+
 def test_agent_prefetches_query_anchors_before_model_selection(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -506,6 +563,9 @@ def test_agent_prefetches_query_anchors_before_model_selection(tmp_path):
 
     assert result.answer == "answer"
     assert len(agent._evidence) == 2
+    assert result.rounds == 1
+    assert result.explorations == 0
+    assert len(result.evidence) == 2
     assert {item["name"] for item in agent.last_query_plan["anchors"]} == {
         "format_header",
         "OutputFormatter",

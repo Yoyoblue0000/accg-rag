@@ -3,6 +3,7 @@
 
 from mini_agent.retrieval_metrics import (
     aggregate_retrieval_metrics,
+    evaluate_anchors,
     evaluate_candidates,
     extract_provisional_gold,
 )
@@ -84,3 +85,34 @@ def test_aggregate_metrics_reports_latency_separately():
     assert summary["latency_ms_p50"] == 20.0
     assert summary["latency_ms_p95"] == 30.0
     assert summary["fallbacks"] == 1
+
+
+def test_anchor_metrics_report_precision_recall_and_type_coverage():
+    gold = extract_provisional_gold(
+        "`format_header` in `src/format.py` works with "
+        "`OutputFormatter`."
+    )
+    anchors = [
+        {
+            "id": "src/format.py::format_header",
+            "name": "format_header",
+            "type": "FUNCTION",
+            "file": "src/format.py",
+        },
+        {
+            "id": "src/format.py::OutputFormatter",
+            "name": "OutputFormatter",
+            "type": "CLASS",
+            "file": "src/format.py",
+        },
+    ]
+
+    metrics = evaluate_anchors(
+        anchors,
+        gold,
+        "Compare the formatting function and formatter class.",
+    )
+
+    assert metrics["anchor_precision"] == 1.0
+    assert metrics["anchor_recall"] == 1.0
+    assert metrics["type_coverage"] == 1.0

@@ -15,6 +15,7 @@ from .retrieval import (
     RetrievalResult,
     build_entries,
     select_query_anchors as _select_query_anchors,
+    tokenize,
 )
 
 logger = logging.getLogger("mini_agent.graph_tool")
@@ -272,6 +273,39 @@ class GraphTool:
             return self._dispatch(action, kwargs)
         except Exception as e:
             return {"error": str(e), "action": action}
+
+    def search(
+        self,
+        query: str,
+        limit: int = 12,
+        use_embeddings: bool | None = None,
+    ) -> RetrievalResult:
+        """内部 search 接口：统一候选检索入口。"""
+        return self.retrieve_query_candidates(
+            query,
+            limit=limit,
+            use_embeddings=(
+                self.enable_embeddings
+                if use_embeddings is None
+                else use_embeddings
+            ),
+        )
+
+    def inspect(self, node_id: str) -> dict:
+        """内部 inspect 接口：精确读取单个实体及其直接关系。"""
+        return self.execute_raw("contextualize", name=node_id, limit=1)
+
+    def traverse(self, action: str, **kwargs):
+        """内部 traverse 接口：执行受控关系扩展。"""
+        allowed = {
+            "call_paths",
+            "transitive_callers",
+            "transitive_callees",
+            "class_hierarchy",
+        }
+        if action not in allowed:
+            return {"error": f"不支持的 traverse 操作: {action}"}
+        return self.execute_raw(action, **kwargs)
 
     # ── 裁剪 ──────────────────────────────────────────────
 
@@ -690,9 +724,23 @@ class GraphTool:
         max_anchors: int = 3,
     ) -> list[dict]:
         """从已排序候选中确定性地选择类型多样的锚点。"""
-        del query
+        query_terms = set(tokenize(query))
+        test_requested = bool(
+            query_terms & {"test", "pytest", "fixture"}
+        )
         typed_candidates = []
         for item in candidates:
+            normalized_path = str(item.get("file", "")).replace("\\", "/")
+            path_parts = normalized_path.lower().split("/")
+            basename = path_parts[-1] if path_parts else ""
+            is_test = (
+                "tests" in path_parts
+                or "test" in path_parts
+                or basename.startswith("test_")
+                or basename.endswith("_test.py")
+            )
+            if is_test and not test_requested:
+                continue
             typed_candidates.append(Candidate(
                 id=item.get("id", ""),
                 name=item.get("name", ""),
@@ -703,13 +751,149 @@ class GraphTool:
                 matched_terms=list(item.get("matched_terms", [])),
                 matched_fields=list(item.get("matched_fields", [])),
             ))
-        return [
-            candidate.to_dict()
-            for candidate in _select_query_anchors(
-                typed_candidates,
-                max_anchors=max_anchors,
-            )
+        anchors = []
+        explicit_type_positions = []
+        for keyword, node_type in (
+            ("function", "FUNCTION"),
+            ("class", "CLASS"),
+            ("method", "METHOD"),
+        ):
+            match = re.search(rf"\b{keyword}s?\b", query, re.IGNORECASE)
+            if match:
+                explicit_type_positions.append((match.start(), node_type))
+        preferred_types = [
+            node_type
+            for _, node_type in sorted(explicit_type_positions)
         ]
+        preferred_types.extend(
+            node_type
+            for node_type in ("FUNCTION", "CLASS", "METHOD")
+            if node_type not in preferred_types
+        )
+        comparison_query = bool(re.search(
+            r"\b(compare|comparison|between|relationship|difference|"
+            r"versus|vs)\b",
+            query,
+            re.IGNORECASE,
+        ))
+        for candidate in _select_query_anchors(
+            typed_candidates,
+            max_anchors=max_anchors,
+            preferred_types=preferred_types,
+            required_types=[
+                node_type
+                for _, node_type in sorted(explicit_type_positions)
+            ],
+            prefer_term_coverage=comparison_query,
+        ):
+            item = candidate.to_dict()
+            if "exact_id" in candidate.sources:
+                reason = "精确 Node ID 匹配"
+            elif "exact_symbol" in candidate.sources:
+                reason = "精确符号匹配"
+            elif candidate.type.lower() in query_terms:
+                reason = f"覆盖问题明确要求的 {candidate.type} 类型"
+            elif candidate.matched_terms:
+                reason = "覆盖新的问题关键词"
+            else:
+                reason = "按候选相关性补足锚点"
+            item.update({
+                "selection_reason": reason,
+                "covered_terms": sorted(set(candidate.matched_terms)),
+                "candidate_sources": list(candidate.sources),
+            })
+            anchors.append(item)
+        return anchors
+
+    def validate_query_anchor(self, anchor: dict) -> dict:
+        """验证锚点身份、路径、行号与源码可读性。"""
+        node_id = str(anchor.get("id", ""))
+        if self._graph is None or node_id not in self._graph.nodes:
+            name = str(anchor.get("name") or node_id.rsplit("::", 1)[-1])
+            suggestions = self.rank_query_candidates(name, limit=3)
+            return {
+                "valid": False,
+                "reason": "node_id_not_found",
+                "message": f"Node ID 不存在: {node_id}",
+                "suggestions": suggestions,
+            }
+
+        data = self._graph.nodes[node_id]
+        node_type = data.get("node_type")
+        actual_type = getattr(node_type, "name", str(node_type or ""))
+        expected_type = str(anchor.get("type", ""))
+        if expected_type and actual_type != expected_type:
+            return {
+                "valid": False,
+                "reason": "type_mismatch",
+                "message": (
+                    f"类型不一致: 候选={expected_type}, 图中={actual_type}"
+                ),
+                "suggestions": [],
+            }
+
+        file_path = str(data.get("file_path") or anchor.get("file") or "")
+        root = self.project_path.resolve()
+        full_path = (root / file_path).resolve()
+        try:
+            full_path.relative_to(root)
+        except ValueError:
+            return {
+                "valid": False,
+                "reason": "path_outside_project",
+                "message": f"文件位于项目根目录之外: {file_path}",
+                "suggestions": [],
+            }
+        if not full_path.is_file():
+            return {
+                "valid": False,
+                "reason": "file_not_found",
+                "message": f"文件不存在: {file_path}",
+                "suggestions": [],
+            }
+
+        try:
+            lines = full_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()
+        except OSError as exc:
+            return {
+                "valid": False,
+                "reason": "source_unreadable",
+                "message": f"源码不可读取: {exc}",
+                "suggestions": [],
+            }
+
+        start_line = data.get("start_line")
+        end_line = data.get("end_line")
+        if (
+            not isinstance(start_line, int)
+            or not isinstance(end_line, int)
+            or start_line < 1
+            or end_line < start_line
+            or end_line > len(lines)
+        ):
+            return {
+                "valid": False,
+                "reason": "invalid_line_range",
+                "message": (
+                    f"无效行号范围: {start_line}-{end_line}, "
+                    f"文件共 {len(lines)} 行"
+                ),
+                "suggestions": [],
+            }
+
+        return {
+            "valid": True,
+            "reason": "validated",
+            "message": "锚点验证通过",
+            "node_id": node_id,
+            "type": actual_type,
+            "file": file_path,
+            "start_line": start_line,
+            "end_line": end_line,
+        }
 
     def _ensure_embedding_ranker(self):
         if self.embedding_ranker is None:

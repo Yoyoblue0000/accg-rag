@@ -534,6 +534,9 @@ class CandidateRetriever:
 def select_query_anchors(
     candidates: list[Candidate],
     max_anchors: int = 3,
+    preferred_types: list[str] | None = None,
+    required_types: list[str] | None = None,
+    prefer_term_coverage: bool = False,
 ) -> list[Candidate]:
     """优先覆盖函数与类，再按原始排名补足。"""
     if max_anchors <= 0:
@@ -541,7 +544,92 @@ def select_query_anchors(
 
     selected: list[Candidate] = []
     selected_ids: set[str] = set()
-    for wanted_type in ("FUNCTION", "CLASS", "METHOD"):
+
+    def _add(candidate: Candidate) -> bool:
+        if candidate.id in selected_ids:
+            return False
+        selected.append(candidate)
+        selected_ids.add(candidate.id)
+        return len(selected) >= max_anchors
+
+    for candidate in candidates:
+        if "exact_id" in candidate.sources and _add(candidate):
+            return selected
+
+    required = required_types or []
+    if required:
+        for wanted_type in required:
+            match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.type == wanted_type
+                    and "exact_symbol" in candidate.sources
+                    and candidate.id not in selected_ids
+                ),
+                None,
+            )
+            if match is not None and _add(match):
+                return selected
+
+        for wanted_type in required:
+            if any(
+                candidate.type == wanted_type
+                for candidate in selected
+            ):
+                continue
+            match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.type == wanted_type
+                    and candidate.id not in selected_ids
+                ),
+                None,
+            )
+            if match is not None and _add(match):
+                return selected
+
+    for candidate in candidates:
+        if (
+            "exact_symbol" in candidate.sources
+            and _add(candidate)
+        ):
+            return selected
+
+    if prefer_term_coverage:
+        remaining = [
+            candidate
+            for candidate in candidates
+            if candidate.id not in selected_ids
+        ]
+        if remaining and not selected:
+            first = remaining.pop(0)
+            _add(first)
+        covered_terms = {
+            term
+            for candidate in selected
+            for term in candidate.matched_terms
+        }
+        while remaining and len(selected) < max_anchors:
+            best_index = max(
+                range(len(remaining)),
+                key=lambda index: (
+                    len(
+                        set(remaining[index].matched_terms)
+                        - covered_terms
+                    ),
+                    -index,
+                ),
+            )
+            candidate = remaining.pop(best_index)
+            _add(candidate)
+            covered_terms.update(candidate.matched_terms)
+        if len(selected) >= max_anchors:
+            return selected
+
+    type_order = preferred_types or ["FUNCTION", "CLASS", "METHOD"]
+    for wanted_type in type_order:
         match = next(
             (
                 candidate
@@ -552,16 +640,10 @@ def select_query_anchors(
             None,
         )
         if match is not None:
-            selected.append(match)
-            selected_ids.add(match.id)
-        if len(selected) >= max_anchors:
-            return selected
+            if _add(match):
+                return selected
 
     for candidate in candidates:
-        if candidate.id in selected_ids:
-            continue
-        selected.append(candidate)
-        selected_ids.add(candidate.id)
-        if len(selected) >= max_anchors:
+        if _add(candidate):
             break
     return selected

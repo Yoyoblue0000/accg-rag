@@ -3,12 +3,14 @@
 import copy
 import json
 import re
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from .model import Model
 from .environment import Environment
 from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
+from .query_plan import Anchor, QueryPlan
 from .retrieval import RetrievalResult
 from accg.models import NodeId
 
@@ -44,6 +46,7 @@ class RunResult:
     evidence: list[EvidenceItem] = field(default_factory=list)
     evidence_selection_report: str | None = None
     model_requests: list[dict] = field(default_factory=list)
+    query_plan: dict | None = None
 
     @property
     def rounds(self) -> int:
@@ -188,6 +191,8 @@ class Agent:
     """Graph-guided ReAct Agent -- 图查询 + 只读文件工具"""
 
     MAX_EXPLORATION_DEPTH = 3
+    QUERY_CANDIDATE_LIMIT = 24
+    CANDIDATE_DISPLAY_LIMIT = 8
 
     def __init__(
         self,
@@ -215,6 +220,7 @@ class Agent:
         self._retrieval_result: RetrievalResult | None = None
         self.last_model_requests: list[dict] = []
         self._full_tool_results: dict[str, str] = {}
+        self.last_query_plan: dict = {}
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -274,6 +280,14 @@ class Agent:
         """执行任务,返回包含完整轨迹的 RunResult"""
         self._trace = []
         self._retrieval_result = None
+        self.messages = []
+        self.step_count = 0
+        self._explored.clear()
+        self._frontier.clear()
+        self._ledger = EvidenceLedger()
+        self.last_model_requests.clear()
+        self._full_tool_results.clear()
+        self.last_query_plan = {}
         graph_status = ""
         if self.graph_tool:
             try:
@@ -286,12 +300,17 @@ class Agent:
         # 预分析：确定性检索 + 可选 embedding 增强
         prelude = ""
         candidates = []
+        query_plan = QueryPlan(query=task)
+        retrieval_started_at = time.perf_counter()
         if self.graph_tool:
             try:
+                search = getattr(self.graph_tool, "search", None)
+                if search is None:
+                    search = self.graph_tool.retrieve_query_candidates
                 self._retrieval_result = (
-                    self.graph_tool.retrieve_query_candidates(
+                    search(
                         task,
-                        limit=8,
+                        limit=self.QUERY_CANDIDATE_LIMIT,
                         use_embeddings=getattr(
                             self.graph_tool,
                             "enable_embeddings",
@@ -303,6 +322,12 @@ class Agent:
                     candidate.to_dict()
                     for candidate in self._retrieval_result.candidates
                 ]
+                query_plan.candidates = list(
+                    self._retrieval_result.candidates
+                )
+                query_plan.diagnostics.extend(
+                    self._retrieval_result.diagnostics
+                )
             except Exception as e:
                 self._retrieval_result = RetrievalResult(
                     candidates=[],
@@ -311,15 +336,179 @@ class Agent:
                     diagnostics=[f"候选检索失败: {e}"],
                     status="failed",
                 )
+                query_plan.diagnostics.append(f"候选检索失败: {e}")
             if candidates:
                 items = []
-                for c in candidates:
+                for c in candidates[:self.CANDIDATE_DISPLAY_LIMIT]:
                     sources = ",".join(c.get("sources", []))
                     items.append(
                         f"  - {c['name']} ({c['type']}) {c['id']} "
                         f"[score={c['score']:.2f}; sources={sources}]"
                     )
                 prelude = "\n\n[候选符号] 以下与问题语义最相关:\n" + "\n".join(items)
+
+                ordered_anchors = self.graph_tool.select_query_anchors(
+                    task,
+                    candidates,
+                    max_anchors=len(candidates),
+                )
+                target_count = min(3, len(ordered_anchors))
+                for anchor_data in ordered_anchors:
+                    if len(query_plan.anchors) >= target_count:
+                        break
+                    validation = self.graph_tool.validate_query_anchor(
+                        anchor_data
+                    )
+                    if not validation.get("valid"):
+                        query_plan.rejected_anchors.append({
+                            "candidate": anchor_data,
+                            "reason": validation.get("reason", "invalid"),
+                            "message": validation.get("message", ""),
+                            "suggestions": validation.get("suggestions", []),
+                        })
+                        continue
+
+                    raw_prefetch = json.dumps(
+                        self.graph_tool.inspect(anchor_data["id"]),
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                    evidence_items = EvidenceItem.from_tool_result(
+                        "query_graph",
+                        {
+                            "action": "contextualize",
+                            "name": anchor_data["id"],
+                        },
+                        raw_prefetch,
+                        step=0,
+                    )
+                    source_items = [
+                        item for item in evidence_items
+                        if item.kind == "source"
+                        and item.node_id == anchor_data["id"]
+                    ]
+                    if not source_items:
+                        query_plan.rejected_anchors.append({
+                            "candidate": anchor_data,
+                            "reason": "prefetch_without_source",
+                            "message": "精确 inspect 未返回锚点源码",
+                            "suggestions": [],
+                        })
+                        continue
+                    for item in evidence_items:
+                        self._ledger.add(item)
+
+                    anchor = Anchor.from_dict(anchor_data)
+                    anchor.validation = validation
+                    anchor.evidence_ids = [
+                        item.evidence_id for item in source_items
+                    ]
+                    anchor.prefetch_action = {
+                        "interface": "inspect",
+                        "adapter": "query_graph",
+                        "action": "contextualize",
+                        "name": anchor.id,
+                    }
+                    query_plan.anchors.append(anchor)
+                    query_plan.prefetch_evidence_ids.extend(
+                        anchor.evidence_ids
+                    )
+                    self._full_tool_results[
+                        f"prefetch:{anchor.id}"
+                    ] = raw_prefetch
+
+                if query_plan.anchors:
+                    prefetched = [
+                        item
+                        for item in self._ledger.source_items
+                        if item.evidence_id
+                        in set(query_plan.prefetch_evidence_ids)
+                    ]
+                    evidence_text, display_reports = (
+                        self._ledger.render_prefetch_evidence(
+                            prefetched
+                        )
+                    )
+                    reports_by_id = {
+                        report["evidence_id"]: report
+                        for report in display_reports
+                    }
+                    for anchor in query_plan.anchors:
+                        report = next(
+                            (
+                                reports_by_id[evidence_id]
+                                for evidence_id in anchor.evidence_ids
+                                if evidence_id in reports_by_id
+                            ),
+                            None,
+                        )
+                        if report is not None:
+                            anchor.display_level = report["display_level"]
+                            anchor.omitted_reason = report["omitted_reason"]
+                    prelude += (
+                        "\n\n[自动验证锚点的证据]\n"
+                        + evidence_text
+                    )
+                if self._retrieval_result is not None:
+                    query_plan.diagnostics.append(
+                        f"成功预取 {len(query_plan.anchors)} 个锚点"
+                    )
+
+                accepted_ids = {
+                    anchor.id for anchor in query_plan.anchors
+                }
+                rejected_ids = {
+                    item.get("candidate", {}).get("id")
+                    for item in query_plan.rejected_anchors
+                }
+                query_requests_tests = bool(
+                    set(re.findall(r"[A-Za-z0-9_]+", task.lower()))
+                    & {"test", "tests", "pytest", "fixture"}
+                )
+                for candidate in candidates:
+                    candidate_id = candidate.get("id")
+                    if (
+                        candidate_id in accepted_ids
+                        or candidate_id in rejected_ids
+                    ):
+                        continue
+                    normalized_path = str(
+                        candidate.get("file", "")
+                    ).replace("\\", "/").lower()
+                    path_parts = normalized_path.split("/")
+                    basename = path_parts[-1] if path_parts else ""
+                    is_test = (
+                        "tests" in path_parts
+                        or "test" in path_parts
+                        or basename.startswith("test_")
+                        or basename.endswith("_test.py")
+                    )
+                    reason = (
+                        "low_quality_test_candidate"
+                        if is_test and not query_requests_tests
+                        else "max_anchor_limit"
+                    )
+                    query_plan.rejected_anchors.append({
+                        "candidate": candidate,
+                        "reason": reason,
+                        "message": (
+                            "问题未询问测试，测试候选不参与锚点选择"
+                            if reason == "low_quality_test_candidate"
+                            else "已达到锚点数量上限"
+                        ),
+                        "suggestions": [],
+                    })
+
+        if self._retrieval_result is not None:
+            self._retrieval_result.duration_ms = (
+                time.perf_counter() - retrieval_started_at
+            ) * 1000
+            query_plan.diagnostics.append(
+                "候选检索与锚点预取总耗时 "
+                f"{self._retrieval_result.duration_ms:.3f}ms"
+            )
+        self.last_query_plan = query_plan.to_dict()
 
         system_content = SYSTEM_PROMPT.replace("__CWD__", self.env.config.cwd).replace("__GRAPH_STATUS__", graph_status)
         user_content = f"任务: {task}{prelude}"
@@ -330,13 +519,6 @@ class Agent:
         ]
         self._emit(MsgRecord(role="system", content=system_content, step=0))
         self._emit(MsgRecord(role="user", content=user_content, step=0))
-
-        self.step_count = 0
-        self._explored.clear()
-        self._frontier.clear()
-        self._ledger = EvidenceLedger()
-        self.last_model_requests.clear()
-        self._full_tool_results.clear()
 
         recent_actions = []
         contextualized_symbols: set[str] = set()
@@ -364,6 +546,7 @@ class Agent:
                     anchor_candidates=candidates,
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
+                    query_plan=copy.deepcopy(self.last_query_plan),
                 )
 
             # API 原生停牌信号（借鉴 OpenCode：finish_reason="stop" 即模型完成）
@@ -379,12 +562,14 @@ class Agent:
                         anchor_candidates=candidates,
                         retrieval=self._retrieval_result,
                         messages=list(self._trace),
+                        query_plan=copy.deepcopy(self.last_query_plan),
                     )
                 return RunResult(
                     answer="[模型未生成有效输出]",
                     anchor_candidates=candidates,
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
+                    query_plan=copy.deepcopy(self.last_query_plan),
                 )
 
             # 无工具调用（finish_reason 可能为 "length" / None）
@@ -398,6 +583,7 @@ class Agent:
                     anchor_candidates=candidates,
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
+                    query_plan=copy.deepcopy(self.last_query_plan),
                 )
 
             # 有工具调用
@@ -483,6 +669,7 @@ class Agent:
             anchor_candidates=candidates,
             retrieval=self._retrieval_result,
             messages=list(self._trace),
+            query_plan=copy.deepcopy(self.last_query_plan),
         )
 
     @staticmethod
@@ -534,7 +721,8 @@ class Agent:
             return RunResult(answer="", error="未收集到任何证据",
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
-                             messages=list(self._trace))
+                             messages=list(self._trace),
+                             query_plan=copy.deepcopy(self.last_query_plan))
 
         # 从账本选择证据（预算内，逐项等级）
         selected = self._ledger.select_for_synthesis()
@@ -544,7 +732,8 @@ class Agent:
             return RunResult(answer="", error="所有证据超出合成预算",
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
-                             messages=list(self._trace))
+                             messages=list(self._trace),
+                             query_plan=copy.deepcopy(self.last_query_plan))
 
         prompt = (
             ANSWER_PROMPT
@@ -567,6 +756,7 @@ class Agent:
             evidence=list(selected),
             evidence_selection_report=selection_report,
             model_requests=copy.deepcopy(self.last_model_requests),
+            query_plan=copy.deepcopy(self.last_query_plan),
         )
 
     def _execute_tool(self, name: str, args: dict) -> str:

@@ -1080,6 +1080,95 @@ class EvidenceLedger:
             used += len(text)
         return separator.join(rendered)
 
+    def render_prefetch_evidence(
+        self,
+        items: list[EvidenceItem],
+        char_budget: int | None = None,
+        separator: str = "\n---\n",
+    ) -> tuple[str, list[dict]]:
+        """按锚点公平分配初始消息预算，并返回逐项展示审计。"""
+        if not items:
+            return "", []
+        budget = (
+            self.OBSERVATION_CHAR_BUDGET
+            if char_budget is None
+            else char_budget
+        )
+        per_anchor_budget = max(256, budget // len(items))
+        rendered = []
+        reports = []
+        used = 0
+
+        for item in items:
+            payload = item.payload if isinstance(item.payload, dict) else {}
+            node_type = str(payload.get("type", ""))
+            line_count = 0
+            if item.start_line is not None and item.end_line is not None:
+                line_count = item.end_line - item.start_line + 1
+            large_class = node_type == "CLASS" and line_count > 50
+
+            if large_class:
+                levels = [
+                    DisplayLevel.PREVIEW,
+                    DisplayLevel.SNIPPET,
+                    DisplayLevel.FOLD,
+                ]
+                omitted_reason = ""
+            else:
+                levels = [
+                    DisplayLevel.COMPLETE,
+                    DisplayLevel.PREVIEW,
+                    DisplayLevel.SNIPPET,
+                    DisplayLevel.FOLD,
+                ]
+                omitted_reason = ""
+
+            chosen_level = DisplayLevel.FOLD
+            chosen_text = item.render(DisplayLevel.FOLD)
+            available = min(
+                per_anchor_budget,
+                max(0, budget - used),
+            )
+            for level in levels:
+                candidate = item.render(level)
+                if len(candidate) <= available:
+                    chosen_level = level
+                    chosen_text = candidate
+                    break
+
+            if (
+                not large_class
+                and chosen_level != DisplayLevel.COMPLETE
+            ):
+                omitted_reason = "单锚点展示预算不足"
+            elif large_class:
+                if chosen_level == DisplayLevel.PREVIEW:
+                    omitted_reason = "大型类使用 preview"
+                elif chosen_level == DisplayLevel.SNIPPET:
+                    omitted_reason = (
+                        "大型类超出 preview 预算，降级为 snippet"
+                    )
+                else:
+                    omitted_reason = (
+                        "大型类超出 snippet 预算，降级为 fold"
+                    )
+            if len(chosen_text) > max(0, budget - used):
+                chosen_text = item.render(DisplayLevel.FOLD)
+                chosen_level = DisplayLevel.FOLD
+                omitted_reason = "总展示预算不足"
+
+            rendered.append(chosen_text)
+            used += len(chosen_text)
+            reports.append({
+                "evidence_id": item.evidence_id,
+                "node_id": item.node_id,
+                "display_level": chosen_level.value,
+                "char_count": len(chosen_text),
+                "omitted_reason": omitted_reason,
+            })
+
+        return separator.join(rendered), reports
+
     def render_selected_for_synthesis(self, separator: str = "\n---\n") -> str:
         """按 select_for_synthesis() 决定的逐项展示等级渲染证据。
 

@@ -13,6 +13,7 @@ from mini_agent.agent import Agent, RunResult, MsgRecord
 from mini_agent.graph_tool import GraphTool
 from mini_agent.retrieval_metrics import (
     aggregate_retrieval_metrics,
+    evaluate_anchors,
     evaluate_candidates,
     extract_provisional_gold,
 )
@@ -42,7 +43,12 @@ def _status_mark(result: RunResult) -> str:
 def _print_silent(run_index: int, total: int, qa: dict, result: RunResult):
     """静默层：每题一行"""
     q = qa["question"][:80]
-    anchors = _fmt_candidates(result.anchor_candidates)
+    selected_anchors = (
+        result.query_plan.get("anchors", [])
+        if result.query_plan
+        else result.anchor_candidates
+    )
+    anchors = _fmt_candidates(selected_anchors)
     ans_len = len(result.answer) if result.answer else 0
     mark = _status_mark(result)
     print(f"[{run_index+1:>2}/{total}] {mark} "
@@ -67,8 +73,16 @@ def _print_summary(results: list[tuple[int, dict, RunResult]]):
     for idx, qa, r in results:
         mark = _status_mark(r)
         top1 = "—"
-        if r.anchor_candidates:
-            top1 = r.anchor_candidates[0].get("label", r.anchor_candidates[0].get("name", "?"))
+        selected_anchors = (
+            r.query_plan.get("anchors", [])
+            if r.query_plan
+            else r.anchor_candidates
+        )
+        if selected_anchors:
+            top1 = selected_anchors[0].get(
+                "label",
+                selected_anchors[0].get("name", "?"),
+            )
         ans_len = len(r.answer) if r.answer else 0
         print(f"{idx:>3} {mark:<3} {r.rounds:>3} {r.explorations:>3} {ans_len:>5}  {top1}")
     print(f"{'─'*60}")
@@ -247,13 +261,28 @@ def main():
                 limit=10,
                 use_embeddings=args.embedding and not args.no_embedding,
             )
+            candidate_dicts = [
+                candidate.to_dict()
+                for candidate in retrieval.candidates
+            ]
+            anchors = graph_tool.select_query_anchors(
+                question,
+                candidate_dicts,
+                max_anchors=3,
+            )
             result = RunResult(
                 answer="",
-                anchor_candidates=[
-                    candidate.to_dict()
-                    for candidate in retrieval.candidates
-                ],
+                anchor_candidates=candidate_dicts,
                 retrieval=retrieval,
+                query_plan={
+                    "query": question,
+                    "candidates": candidate_dicts,
+                    "anchors": anchors,
+                    "rejected_anchors": [],
+                    "prefetch_evidence_ids": [],
+                    "relation_expansions": [],
+                    "diagnostics": list(retrieval.diagnostics),
+                },
             )
         else:
             agent = Agent(
@@ -286,6 +315,20 @@ def main():
             retrieval_payload["candidates"],
             gold,
         )
+        query_plan_payload = result.query_plan or {
+            "query": question,
+            "candidates": retrieval_payload["candidates"],
+            "anchors": [],
+            "rejected_anchors": [],
+            "prefetch_evidence_ids": [],
+            "relation_expansions": [],
+            "diagnostics": ["Agent 未返回查询计划"],
+        }
+        anchor_metrics = evaluate_anchors(
+            query_plan_payload["anchors"],
+            gold,
+            question,
+        )
 
         # 每答完一题立即写入
         artifact_records.append({
@@ -300,6 +343,19 @@ def main():
             "retrieval": retrieval_payload,
             "provisional_gold": gold.to_dict(),
             "retrieval_metrics": retrieval_metrics,
+            "query_plan": query_plan_payload,
+            "anchor_metrics": anchor_metrics,
+            "prefetch_evidence_ids": query_plan_payload[
+                "prefetch_evidence_ids"
+            ],
+            "first_request_display_levels": [
+                {
+                    "id": anchor.get("id", ""),
+                    "display_level": anchor.get("display_level", ""),
+                    "omitted_reason": anchor.get("omitted_reason", ""),
+                }
+                for anchor in query_plan_payload["anchors"]
+            ],
         })
         out_path.write_text(
             json.dumps(artifact_records, ensure_ascii=False, indent=2),
@@ -333,7 +389,10 @@ def main():
             f"P50={retrieval_summary['latency_ms_p50']:.1f}ms "
             f"P95={retrieval_summary['latency_ms_p95']:.1f}ms "
             f"fallback={retrieval_summary['fallbacks']} "
-            f"failed={retrieval_summary['retrieval_failures']}"
+            f"failed={retrieval_summary['retrieval_failures']} "
+            f"anchor_P={retrieval_summary['anchor_precision']:.3f} "
+            f"anchor_R={retrieval_summary['anchor_recall']:.3f} "
+            f"type_cov={retrieval_summary['type_coverage']:.3f}"
         )
 
     print(f"\n结果已保存到 {out_path}")
