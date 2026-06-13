@@ -417,6 +417,49 @@ def test_class_hierarchy_returns_resolved_node_ids_and_correct_direction(tmp_pat
     }
 
 
+def test_instantiation_evidence_preserves_via_class():
+    raw = json.dumps({
+        "query": "src/base.py::BaseFormatter",
+        "exact": True,
+        "results": [{
+            "id": "src/base.py::BaseFormatter",
+            "name": "BaseFormatter",
+            "type": "CLASS",
+            "file": "src/base.py",
+            "start_line": 1,
+            "end_line": 3,
+            "source_context": "class BaseFormatter:\n    pass",
+            "instantiated_by": [{
+                "id": "src/factory.py::build_formatter",
+                "name": "build_formatter",
+                "file": "src/factory.py",
+                "confidence": 0.9,
+                "strategy": "constructor",
+                "via_class": "src/child.py::ChildFormatter",
+            }],
+        }],
+    })
+
+    items = EvidenceItem.from_tool_result(
+        "query_graph",
+        {
+            "action": "contextualize",
+            "name": "src/base.py::BaseFormatter",
+        },
+        raw,
+        step=1,
+    )
+    relation = next(
+        item
+        for item in items
+        if item.edge_type == "INSTANTIATED_BY"
+    )
+
+    assert relation.payload["via_class"] == (
+        "src/child.py::ChildFormatter"
+    )
+
+
 class _FinalModel:
     def __init__(self):
         self.last_messages = None
@@ -599,6 +642,101 @@ class _RepeatedFinalModel:
         return "verified answer"
 
 
+class _StopOnlyModel:
+    def __init__(self):
+        self.query_messages = []
+        self.generate_messages = None
+
+    def query(self, messages):
+        self.query_messages.append(copy.deepcopy(messages))
+        return {
+            "content": "There is no caller in the bounded search scope.",
+            "raw_content": "THOUGHT: There is no caller in the bounded search scope.",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+
+    def generate(self, messages):
+        self.generate_messages = copy.deepcopy(messages)
+        return "bounded negative answer"
+
+
+def test_finish_reason_stop_cannot_bypass_relation_gate(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "isolated.py").write_text(
+        "def isolated_function():\n"
+        "    return 1\n"
+        "# end\n",
+        encoding="utf-8",
+    )
+    graph = nx.MultiDiGraph()
+    _add_symbol(
+        graph,
+        "src/isolated.py::isolated_function",
+        NodeType.FUNCTION,
+        "isolated_function",
+        "src/isolated.py",
+    )
+    tool = _graph_tool(graph, tmp_path)
+    model = _StopOnlyModel()
+    agent = Agent(
+        model,
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=tool,
+    )
+
+    result = agent.run("What calls isolated_function?")
+
+    assert result.answer == "bounded negative answer"
+    assert len(model.query_messages) == 2
+    assert not any(
+        message["role"] == "assistant"
+        for message in model.query_messages[1]
+    )
+    expansion = agent.last_query_plan["relation_expansions"][0]
+    assert expansion["action"] == "transitive_callers"
+    assert expansion["status"] == "completed"
+    assert expansion["result_count"] == 0
+    synthesis_prompt = model.generate_messages[0]["content"]
+    assert "限定搜索记录" in synthesis_prompt
+    assert "max_depth=2" in synthesis_prompt
+    assert "min_confidence=0.45" in synthesis_prompt
+
+
+def test_auto_expansion_error_is_not_recorded_as_completed(tmp_path):
+    from mini_agent.query_plan import QueryPlan
+    from mini_agent.sufficiency import ExpansionRequest
+
+    class _ErrorGraphTool:
+        def execute_full(self, action, **kwargs):
+            return json.dumps({
+                "error": "graph query failed",
+                "action": action,
+            })
+
+    agent = Agent(
+        _FinalModel(),
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=_ErrorGraphTool(),
+    )
+    query_plan = QueryPlan(query="What calls target?")
+
+    agent._execute_expansions(
+        [ExpansionRequest(
+            action="transitive_callers",
+            symbol="src/a.py::target",
+            edge_types=["CALLS"],
+        )],
+        query_plan,
+    )
+
+    expansion = query_plan.relation_expansions[0]
+    assert expansion["status"] == "failed"
+    assert "graph query failed" in expansion["error"]
+    assert query_plan.diagnostics
+
+
 def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -625,6 +763,14 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     caller_lines.append("    click.echo(format_linting_result_header())")
     (source_dir / "commands.py").write_text(
         "\n".join(caller_lines) + "\n",
+        encoding="utf-8",
+    )
+    (source_dir / "upstream.py").write_text(
+        "def second_hop():\n"
+        "    return lint(None)\n"
+        "\n"
+        "def third_hop():\n"
+        "    return second_hop()\n",
         encoding="utf-8",
     )
 
@@ -661,6 +807,20 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
         "src/commands.py",
         docstring="Lint files and emit results.",
     )
+    _add_symbol(
+        graph,
+        "src/upstream.py::second_hop",
+        NodeType.FUNCTION,
+        "second_hop",
+        "src/upstream.py",
+    )
+    _add_symbol(
+        graph,
+        "src/upstream.py::third_hop",
+        NodeType.FUNCTION,
+        "third_hop",
+        "src/upstream.py",
+    )
     graph.nodes["src/formatters.py::OutputStreamFormatter"]["end_line"] = 6
     graph.nodes["src/formatters.py::OutputStreamFormatter"]["start_line"] = 4
     graph.nodes["src/commands.py::lint"]["end_line"] = len(caller_lines)
@@ -675,8 +835,30 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
             confidence=0.95,
             strategy="test",
         )
+    graph.add_edge(
+        "src/upstream.py::second_hop",
+        "src/commands.py::lint",
+        edge_type=EdgeType.CALLS,
+        confidence=0.95,
+        strategy="test",
+    )
+    graph.add_edge(
+        "src/upstream.py::third_hop",
+        "src/upstream.py::second_hop",
+        edge_type=EdgeType.CALLS,
+        confidence=0.95,
+        strategy="test",
+    )
 
     tool = _graph_tool(graph, tmp_path)
+    expansion_calls = []
+    original_execute_full = tool.execute_full
+
+    def _record_execute_full(action, **kwargs):
+        expansion_calls.append((action, copy.deepcopy(kwargs)))
+        return original_execute_full(action, **kwargs)
+
+    tool.execute_full = _record_execute_full
     model = _RepeatedFinalModel()
     agent = Agent(
         model,
@@ -690,11 +872,29 @@ def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     )
 
     assert result.answer == "verified answer"
-    # P4 门控：lint 作为锚点与 format_linting_result_header 有 CALLS 边，
-    # 关系证据连接 ≥2 个锚点实体，门控首次即通过，无需扩展
-    assert len(model.query_messages) == 1
-    assert result.evidence
+    assert result.finish_draft == "header 和 formatter 只是职责分离"
+    assert len(model.query_messages) == 2
+    expansions = agent.last_query_plan["relation_expansions"]
+    assert expansions
+    assert "src/commands.py::lint" in expansions[0]["expanded_node_ids"]
+    assert "src/upstream.py::second_hop" in expansions[0]["expanded_node_ids"]
+    assert "src/upstream.py::third_hop" not in expansions[0]["expanded_node_ids"]
+    transitive_call = next(
+        call
+        for call in expansion_calls
+        if call[0] == "transitive_callers"
+    )
+    assert transitive_call[1]["max_depth"] == 2
+    assert transitive_call[1]["min_confidence"] == 0.45
+    assert expansions[0]["max_depth"] == 2
+    assert expansions[0]["min_confidence"] == 0.45
+    assert expansions[0]["status"] == "completed"
+    assert expansions[0]["source_evidence_ids"]
+    retry_message = model.query_messages[1][-1]["content"]
+    assert "[证据充分性检查未通过]" in retry_message
+    assert "click.echo(format_linting_result_header())" in retry_message
     synthesis_prompt = model.generate_messages[0]["content"]
+    assert "click.echo(format_linting_result_header())" in synthesis_prompt
     assert "header 和 formatter 只是职责分离" in synthesis_prompt
 
 

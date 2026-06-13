@@ -14,8 +14,8 @@ from .query_plan import Anchor, QueryPlan
 from .retrieval import RetrievalResult
 from .sufficiency import (
     FinishAction,
-    GateDecision,
     ExpansionRequest,
+    GateDecision,
     SufficiencyGate,
 )
 from accg.models import NodeId
@@ -53,6 +53,7 @@ class RunResult:
     evidence_selection_report: str | None = None
     model_requests: list[dict] = field(default_factory=list)
     query_plan: dict | None = None
+    finish_draft: str | None = None
 
     @property
     def rounds(self) -> int:
@@ -61,14 +62,6 @@ class RunResult:
     @property
     def explorations(self) -> int:
         return sum(1 for m in self.messages if m.role == "tool" and not m.intercepted)
-
-_FINAL_PATTERN = re.compile(r"FINAL[:\s]\s*(.+?)(?=\n(?:ACTION|THOUGHT):|\Z)", re.DOTALL)
-
-
-def _extract_final(content: str) -> str | None:
-    m = _FINAL_PATTERN.search(content)
-    return m.group(1).strip() if m else None
-
 
 def _parse_graph_path_ids(result_json: str) -> list[tuple[str, int]]:
     """从 call_paths/transitive_* 返回结果中提取 (node_id, depth) 列表"""
@@ -125,6 +118,28 @@ def _collect_node_ids(result_json: str) -> list[str]:
 
     _walk(data)
     return ids
+
+
+def _collect_endpoint_node_ids(result_json: str) -> list[str]:
+    """从传递查询结果中提取端点节点，保持原始顺序并去重。"""
+    try:
+        data = json.loads(result_json)
+    except json.JSONDecodeError:
+        return []
+    entries = data if isinstance(data, list) else data.get(
+        "items",
+        data.get("results", []),
+    )
+    node_ids = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        node_id = entry.get("endpoint_node_id") or entry.get("id")
+        if isinstance(node_id, str) and node_id and node_id not in seen:
+            seen.add(node_id)
+            node_ids.append(node_id)
+    return node_ids
 
 
 SYSTEM_PROMPT = """
@@ -189,6 +204,10 @@ __EVIDENCE__
 
 __DRAFT__
 
+## 限定搜索记录（仅用于说明搜索范围，不属于事实证据）
+
+__SEARCH_SCOPE__
+
 ## 请回答
 """
 
@@ -230,6 +249,7 @@ class Agent:
         self._gate = SufficiencyGate()
         self._expansion_count = 0
         self._expanded_relations: set[str] = set()
+        self._latest_finish_draft = ""
 
     def _emit(self, record: MsgRecord) -> None:
         self._trace.append(record)
@@ -299,6 +319,7 @@ class Agent:
         self.last_query_plan = {}
         self._expansion_count = 0
         self._expanded_relations.clear()
+        self._latest_finish_draft = ""
         graph_status = ""
         if self.graph_tool:
             try:
@@ -363,7 +384,10 @@ class Agent:
                     candidates,
                     max_anchors=len(candidates),
                 )
-                target_count = min(3, len(ordered_anchors))
+                target_count = min(
+                    self._gate.recommended_anchor_count(task),
+                    len(ordered_anchors),
+                )
                 for anchor_data in ordered_anchors:
                     if len(query_plan.anchors) >= target_count:
                         break
@@ -542,22 +566,19 @@ class Agent:
 
             thought = response.get("content", "").strip()
             raw_content = response.get("raw_content", "")
-            finish_reason = response.get("finish_reason")
 
             # 模型完成信号检测
             finish_action = FinishAction.from_content(raw_content)
             has_tools = bool(response["tool_calls"])
             model_done = (
                 finish_action is not None
-                or (finish_reason == "stop" and not has_tools)
-                or (not has_tools and self._ledger.has_synthesis_evidence)
+                or not has_tools
             )
 
             if model_done:
-                draft = (
-                    finish_action.draft if finish_action
-                    else (thought if thought else "")
-                )
+                if finish_action is not None:
+                    self._latest_finish_draft = finish_action.draft
+                draft = finish_action.draft if finish_action else thought
                 self._emit(MsgRecord(role="assistant", content=raw_content, step=self.step_count))
                 self.messages.append({"role": "assistant", "content": thought})
 
@@ -579,18 +600,21 @@ class Agent:
                     gate_decision.expansion_requests
                     and self._expansion_count < SufficiencyGate.MAX_AUTO_EXPANSIONS
                 ):
-                    self._execute_expansions(
+                    expanded_items = self._execute_expansions(
                         gate_decision.expansion_requests,
                         query_plan,
                     )
                     self._expansion_count += 1
+                    self.last_query_plan = query_plan.to_dict()
 
                     # 压缩旧工具结果，保留最近轮次
                     self._compress_messages(keep_recent_turns=3)
 
                     # 通知模型证据不足，包含新增证据
                     gate_msg = self._format_gate_failure_message(
-                        gate_decision, draft
+                        gate_decision,
+                        draft,
+                        expanded_items,
                     )
                     self.messages.append({
                         "role": "user",
@@ -618,6 +642,7 @@ class Agent:
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
                     query_plan=copy.deepcopy(self.last_query_plan),
+                    finish_draft=self._latest_finish_draft or None,
                 )
 
             # 有工具调用 —— 正常探索
@@ -663,6 +688,11 @@ class Agent:
                         tool_name, args, obs_raw, self.step_count)
                     for ei in evidence_items:
                         self._ledger.add(ei)
+                    self._register_dynamic_anchors(
+                        evidence_items,
+                        query_plan,
+                    )
+                    self.last_query_plan = query_plan.to_dict()
                     obs_text = self._ledger.render_for_observation(evidence_items)
                     if not obs_text:
                         obs_text = self._format_for_llm(obs_raw, tool_name, args)
@@ -704,78 +734,260 @@ class Agent:
             retrieval=self._retrieval_result,
             messages=list(self._trace),
             query_plan=copy.deepcopy(self.last_query_plan),
+            finish_draft=self._latest_finish_draft or None,
         )
+
+    @staticmethod
+    def _register_dynamic_anchors(
+        evidence_items: list[EvidenceItem],
+        query_plan: QueryPlan,
+    ) -> None:
+        """将模型精确定位到的完整源码登记为动态验证锚点。"""
+        known_ids = {
+            anchor.id
+            for anchor in query_plan.anchors
+        }
+        for item in evidence_items:
+            if item.kind != "source" or not item.complete or not item.node_id:
+                continue
+            payload = item.payload if isinstance(item.payload, dict) else {}
+            node_type = str(payload.get("type", ""))
+            file_path = str(item.file or payload.get("file", ""))
+            if (
+                item.node_id in known_ids
+                or not node_type
+                or not file_path
+                or item.start_line is None
+                or item.end_line is None
+            ):
+                continue
+            anchor = Anchor(
+                id=item.node_id,
+                name=str(payload.get("name", item.node_id.split("::")[-1])),
+                type=node_type,
+                file=file_path,
+                score=0.0,
+                sources=["model_exploration"],
+                selection_reason="模型通过精确图查询定位",
+                covered_terms=[],
+                candidate_sources=["model_exploration"],
+            )
+            anchor.validation = {
+                "valid": True,
+                "reason": "exact_contextualize_result",
+            }
+            anchor.evidence_ids = [item.evidence_id]
+            anchor.prefetch_action = {
+                "interface": "model_exploration",
+                "adapter": "query_graph",
+                "action": "contextualize",
+                "name": item.node_id,
+            }
+            query_plan.anchors.append(anchor)
+            known_ids.add(item.node_id)
 
     def _execute_expansions(
         self,
         requests: list[ExpansionRequest],
         query_plan: QueryPlan,
-    ) -> None:
+    ) -> list[EvidenceItem]:
         """执行受控关系扩展：遍历 → 写入账本 → 记录到 query_plan。"""
         if not self.graph_tool:
-            return
+            return []
+        observed_items: list[EvidenceItem] = []
         for req in requests:
+            record = {
+                "reason": req.reason,
+                "action": req.action,
+                "symbol": req.symbol,
+                "target": req.target,
+                "max_depth": req.max_depth,
+                "min_confidence": req.min_confidence,
+                "edge_types": list(req.edge_types),
+                "status": "completed",
+                "result_count": 0,
+                "expanded_node_ids": [],
+                "evidence_ids": [],
+                "source_evidence_ids": [],
+                "step": self.step_count,
+            }
             try:
-                if req.action == "contextualize":
+                items: list[EvidenceItem] = []
+                expanded_node_ids = []
+                if req.action == "shared_callers" and req.target:
+                    endpoint_sets = []
+                    subqueries = []
+                    for symbol in (req.symbol, req.target):
+                        kwargs = {
+                            "symbol": symbol,
+                            "max_depth": req.max_depth,
+                            "min_confidence": req.min_confidence,
+                        }
+                        raw = self.graph_tool.execute_full(
+                            "transitive_callers",
+                            **kwargs,
+                        )
+                        tool_args = {
+                            "action": "transitive_callers",
+                            **kwargs,
+                        }
+                        items.extend(EvidenceItem.from_tool_result(
+                            "query_graph",
+                            tool_args,
+                            raw,
+                            step=self.step_count,
+                        ))
+                        endpoint_sets.append(
+                            set(_collect_endpoint_node_ids(raw))
+                        )
+                        subqueries.append(kwargs)
+                    shared_ids = (
+                        set.intersection(*endpoint_sets)
+                        if endpoint_sets
+                        else set()
+                    )
+                    expanded_node_ids = sorted(shared_ids)
+                    record["subqueries"] = subqueries
+                    items.extend(
+                        self._contextualize_expansion_nodes(
+                            expanded_node_ids[:5],
+                        )
+                    )
+                elif req.action == "contextualize":
+                    tool_args = {
+                        "action": "contextualize",
+                        "name": req.symbol,
+                        "limit": 1,
+                    }
                     raw = self.graph_tool.execute_full(
                         "contextualize",
                         name=req.symbol,
                         limit=1,
                     )
+                    items = EvidenceItem.from_tool_result(
+                        "query_graph",
+                        tool_args,
+                        raw,
+                        step=self.step_count,
+                    )
+                    expanded_node_ids = [req.symbol]
                 elif req.action in (
                     "transitive_callers", "transitive_callees",
                     "call_paths",
                 ):
-                    kwargs: dict = {"symbol": req.symbol}
+                    kwargs: dict = {
+                        "symbol": req.symbol,
+                        "max_depth": req.max_depth,
+                        "min_confidence": req.min_confidence,
+                    }
                     if req.action == "call_paths" and req.target:
                         kwargs["source"] = req.symbol
                         kwargs["target"] = req.target
                     raw = self.graph_tool.execute_full(req.action, **kwargs)
+                    tool_args = {
+                        "action": req.action,
+                        **kwargs,
+                    }
+                    items = EvidenceItem.from_tool_result(
+                        "query_graph",
+                        tool_args,
+                        raw,
+                        step=self.step_count,
+                    )
+                    if req.action in (
+                        "transitive_callers",
+                        "transitive_callees",
+                    ):
+                        expanded_node_ids = _collect_endpoint_node_ids(raw)
+                        items.extend(
+                            self._contextualize_expansion_nodes(
+                                expanded_node_ids[:5],
+                            )
+                        )
                 elif req.action == "class_hierarchy":
+                    tool_args = {
+                        "action": "class_hierarchy",
+                        "class_name": req.symbol,
+                    }
                     raw = self.graph_tool.execute_full(
                         "class_hierarchy",
                         class_name=req.symbol,
                     )
+                    items = EvidenceItem.from_tool_result(
+                        "query_graph",
+                        tool_args,
+                        raw,
+                        step=self.step_count,
+                    )
                 else:
                     continue
 
-                tool_args = {"action": req.action}
-                if req.action == "class_hierarchy":
-                    tool_args["class_name"] = req.symbol
-                elif req.action == "contextualize":
-                    tool_args["name"] = req.symbol
-                else:
-                    tool_args["symbol"] = req.symbol
-                items = EvidenceItem.from_tool_result(
-                    "query_graph",
-                    tool_args,
-                    raw,
-                    step=self.step_count,
-                )
-                new_ids = []
-                for ei in items:
-                    result = self._ledger.add(ei)
+                observed_items.extend(items)
+
+                evidence_ids = []
+                source_evidence_ids = []
+                error_items = [
+                    item for item in items
+                    if item.kind == "error"
+                ]
+                for item in items:
+                    result = self._ledger.add(item)
                     if result in ("added", "merged"):
-                        new_ids.append(ei.evidence_id)
+                        evidence_ids.append(item.evidence_id)
+                        if item.kind == "source":
+                            source_evidence_ids.append(item.evidence_id)
 
-                # 记录已扩展，防止重复
-                self._expanded_relations.add(
-                    f"{req.action}:{req.symbol}"
+                record["result_count"] = len(items)
+                record["relation_result_count"] = sum(
+                    1 for item in items
+                    if item.kind == "relation"
                 )
-
-                query_plan.relation_expansions.append({
-                    "reason": req.reason,
-                    "action": req.action,
-                    "symbol": req.symbol,
-                    "target": req.target,
-                    "max_depth": req.max_depth,
-                    "evidence_ids": new_ids,
-                    "step": self.step_count,
-                })
+                record["expanded_node_ids"] = expanded_node_ids
+                record["evidence_ids"] = evidence_ids
+                record["source_evidence_ids"] = source_evidence_ids
+                if error_items:
+                    record["status"] = "failed"
+                    record["error"] = "; ".join(
+                        str(item.payload)
+                        for item in error_items
+                    )
+                    query_plan.diagnostics.append(
+                        f"扩展失败 [{req.action} {req.symbol}]: "
+                        f"{record['error']}"
+                    )
+                self._expanded_relations.add(req.key)
             except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
                 query_plan.diagnostics.append(
                     f"扩展失败 [{req.action} {req.symbol}]: {exc}"
                 )
+            query_plan.relation_expansions.append(record)
+        return observed_items
+
+    def _contextualize_expansion_nodes(
+        self,
+        node_ids: list[str],
+    ) -> list[EvidenceItem]:
+        items = []
+        for node_id in node_ids:
+            context_args = {
+                "action": "contextualize",
+                "name": node_id,
+                "limit": 1,
+            }
+            context_raw = self.graph_tool.execute_full(
+                "contextualize",
+                name=node_id,
+                limit=1,
+            )
+            items.extend(EvidenceItem.from_tool_result(
+                "query_graph",
+                context_args,
+                context_raw,
+                step=self.step_count,
+            ))
+        return items
 
     def _compress_messages(self, keep_recent_turns: int = 2) -> None:
         """压缩消息历史：旧工具结果替换为证据 ID 摘要，保留最近 N 轮。
@@ -783,17 +995,13 @@ class Agent:
         移除被门控拒绝的 FINAL 消息，确保模型不会看到自己被驳回的结论。
         审计仍保存完整原始请求。
         """
-        if len(self.messages) <= keep_recent_turns * 2 + 2:
+        if len(self.messages) <= 2:
             return
 
         all_evidence_ids = [
             item.evidence_id for item in self._ledger.items()
         ]
-        if not all_evidence_ids:
-            return
-
         # 找到最后一条 assistant 消息（被门控拒绝的 FINAL）
-        # 以及它之前的 tool 消息，全部移除
         last_idx = len(self.messages) - 1
         while last_idx >= 2:
             role = self.messages[last_idx].get("role", "")
@@ -801,24 +1009,40 @@ class Agent:
                 break
             last_idx -= 1
 
-        # 保留: system + user（前 2 条）+ 最近 keep_recent_turns 轮
-        # 但要移除被拒绝的 FINAL assistant 消息
-        keep_start = max(2, last_idx - keep_recent_turns * 2)
-        # 不保留被拒绝的 FINAL 本身（它在 last_idx）
-        keep_end = min(last_idx, len(self.messages))
+        if last_idx < 2:
+            return
+
+        keep_end = last_idx
+        keep_start = max(2, keep_end - keep_recent_turns * 3)
+        while (
+            keep_start > 2
+            and self.messages[keep_start].get("role") == "tool"
+        ):
+            keep_start -= 1
 
         # 重建消息列表
         new_messages = list(self.messages[:2])  # system + user
+        anchor_ids = [
+            anchor.get("id", "")
+            for anchor in self.last_query_plan.get("anchors", [])
+            if anchor.get("id")
+        ]
+        expansion_count = len(
+            self.last_query_plan.get("relation_expansions", [])
+        )
         new_messages.append({
             "role": "user",
             "content": (
                 f"[证据摘要] 前面探索已收集 {len(all_evidence_ids)} 条证据，"
+                f"证据 ID: {', '.join(all_evidence_ids) or '无'}。"
+                f"已验证锚点: {', '.join(anchor_ids) or '无'}。"
+                f"已执行关系扩展: {expansion_count} 次。"
                 "完整数据在证据账本中。"
                 "你可以继续用工具探索更多证据，"
                 "或输出 FINAL: <答案>。"
             ),
         })
-        # 保留 last_idx 之前的最近几轮（不包含被拒 FINAL）
+        # 保留被拒 FINAL 之前的最近必要轮次
         if keep_start < keep_end:
             new_messages.extend(self.messages[keep_start:keep_end])
 
@@ -828,6 +1052,7 @@ class Agent:
     def _format_gate_failure_message(
         decision: GateDecision,
         draft: str,
+        expanded_items: list[EvidenceItem],
     ) -> str:
         """构建门控未通过的通知消息，附加新证据提示。"""
         parts = [
@@ -840,9 +1065,27 @@ class Agent:
                 f"已自动扩展 {len(decision.expansion_requests)} 个关系，"
                 "新增证据已写入账本，请重新评估证据是否充分。"
             )
+        if expanded_items:
+            parts.append("\n## 新增证据")
+            parts.append(
+                "\n---\n".join(
+                    item.render(
+                        DisplayLevel.COMPLETE
+                        if item.kind == "source"
+                        else (
+                            DisplayLevel.PREVIEW
+                            if item.kind == "relation"
+                            else DisplayLevel.FOLD
+                        )
+                    )
+                    for item in expanded_items
+                )
+            )
+        else:
+            parts.append("\n## 扩展结果\n限定范围内未获取到新增证据。")
         if draft:
             parts.append(
-                f"\n你之前的草稿（参考，可修改）:\n{draft[:500]}"
+                f"\n你之前的草稿（参考，可修改）:\n{draft}"
             )
         parts.append(
             "\n## 请继续\n"
@@ -903,7 +1146,8 @@ class Agent:
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
                              messages=list(self._trace),
-                             query_plan=copy.deepcopy(self.last_query_plan))
+                             query_plan=copy.deepcopy(self.last_query_plan),
+                             finish_draft=self._latest_finish_draft or None)
 
         # 从账本选择证据（预算内，逐项等级）
         selected = self._ledger.select_for_synthesis()
@@ -914,13 +1158,18 @@ class Agent:
                              anchor_candidates=candidates,
                              retrieval=self._retrieval_result,
                              messages=list(self._trace),
-                             query_plan=copy.deepcopy(self.last_query_plan))
+                             query_plan=copy.deepcopy(self.last_query_plan),
+                             finish_draft=self._latest_finish_draft or None)
 
         prompt = (
             ANSWER_PROMPT
             .replace("__QUESTION__", task)
             .replace("__EVIDENCE__", evidence_text)
             .replace("__DRAFT__", draft or "无")
+            .replace(
+                "__SEARCH_SCOPE__",
+                self._render_search_scope(),
+            )
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -938,7 +1187,34 @@ class Agent:
             evidence_selection_report=selection_report,
             model_requests=copy.deepcopy(self.last_model_requests),
             query_plan=copy.deepcopy(self.last_query_plan),
+            finish_draft=self._latest_finish_draft or None,
         )
+
+    def _render_search_scope(self) -> str:
+        expansions = self.last_query_plan.get(
+            "relation_expansions",
+            [],
+        )
+        if not expansions:
+            return "无"
+        lines = []
+        for record in expansions:
+            target = (
+                f" -> {record.get('target')}"
+                if record.get("target")
+                else ""
+            )
+            lines.append(
+                "- "
+                f"{record.get('action')} "
+                f"{record.get('symbol')}{target}; "
+                f"edges={record.get('edge_types', [])}; "
+                f"max_depth={record.get('max_depth')}; "
+                f"min_confidence={record.get('min_confidence')}; "
+                f"status={record.get('status')}; "
+                f"result_count={record.get('result_count')}"
+            )
+        return "\n".join(lines)
 
     def _execute_tool(self, name: str, args: dict) -> str:
         """执行工具并返回未裁剪结果，展示预算由证据账本负责。"""

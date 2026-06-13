@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -23,7 +24,8 @@ class FinishAction:
 
 
 _FINAL_PATTERN = re.compile(
-    r"FINAL[:\s]\s*(.+?)(?=\n(?:ACTION|THOUGHT):|\Z)", re.DOTALL
+    r"^[ \t]*FINAL[:\s]\s*(.+?)(?=^[ \t]*(?:ACTION|THOUGHT):|\Z)",
+    re.DOTALL | re.MULTILINE,
 )
 
 
@@ -34,8 +36,16 @@ class ExpansionRequest:
     symbol: str               # 扩展的源符号
     target: str | None = None # call_paths 需要的目标符号
     max_depth: int = 2
+    min_confidence: float = 0.45
     reason: str = ""
     edge_types: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        parts = [self.action, self.symbol]
+        if self.target:
+            parts.append(self.target)
+        return ":".join(parts)
 
 
 @dataclass
@@ -52,6 +62,7 @@ class GateDecision:
 _COMPARISON_KEYWORDS = {
     "compare", "comparison", "between", "relationship",
     "difference", "versus", "vs", "differ", "contrast",
+    "比较", "对比", "区别", "差异", "关系",
 }
 _RELATION_KEYWORDS = {
     "call", "calls", "calling", "caller", "callee",
@@ -60,24 +71,37 @@ _RELATION_KEYWORDS = {
     "instantiate", "instantiation", "instance",
     "relationship", "relation", "connect", "connection",
     "flow", "dataflow", "path",
+    "调用", "被调用", "调用者", "被调用者", "关系", "连接",
+    "数据流", "路径", "继承", "实例化",
 }
 _INHERITANCE_KEYWORDS = {
     "inherit", "inherits", "inheritance", "subclass", "superclass",
     "parent", "child", "base class", "derived",
     "hierarchy", "extends", "polymorphic", "polymorphism",
+    "继承", "子类", "父类", "基类", "派生类", "类层次", "多态",
+}
+_INSTANTIATION_KEYWORDS = {
+    "instantiate", "instantiates", "instantiated", "instantiating",
+    "instantiation", "instance", "constructor", "construct",
+    "实例化", "创建实例", "构造",
+}
+_NEGATIVE_KEYWORDS = {
+    "no", "not", "none", "doesn't", "don't", "isn't",
+    "没有", "不存在", "无关系", "未发现", "找不到",
 }
 
 
 def _has_keywords(text: str, keywords: set[str]) -> bool:
-    return bool(set(re.findall(r"[a-z]+", text.lower())) & keywords)
-
-
-def _count_source_items(evidence_items: list) -> int:
-    return sum(1 for e in evidence_items if getattr(e, "kind", "") == "source")
-
-
-def _count_relation_items(evidence_items: list) -> int:
-    return sum(1 for e in evidence_items if getattr(e, "kind", "") == "relation")
+    lowered = text.lower()
+    words = set(re.findall(r"[a-z]+", lowered))
+    for keyword in keywords:
+        normalized = keyword.lower()
+        if re.fullmatch(r"[a-z]+", normalized):
+            if normalized in words:
+                return True
+        elif normalized in lowered:
+            return True
+    return False
 
 
 def _get_validated_anchor_ids(query_plan: dict) -> set[str]:
@@ -87,6 +111,35 @@ def _get_validated_anchor_ids(query_plan: dict) -> set[str]:
         for a in anchors
         if a.get("validation", {}).get("valid")
     }
+
+
+def _get_validated_anchors(query_plan: dict) -> list[dict]:
+    return [
+        anchor
+        for anchor in query_plan.get("anchors", [])
+        if anchor.get("validation", {}).get("valid")
+    ]
+
+
+def _get_primary_anchors(
+    question: str,
+    anchors: list[dict],
+    limit: int,
+) -> list[dict]:
+    if len(anchors) <= limit:
+        return anchors
+    lowered = question.lower()
+    explicitly_named = [
+        anchor
+        for anchor in anchors
+        if (
+            anchor.get("id", "").lower() in lowered
+            or anchor.get("name", "").lower() in lowered
+        )
+    ]
+    if len(explicitly_named) >= limit:
+        return explicitly_named[:limit]
+    return anchors[:limit]
 
 
 def _get_source_node_ids(evidence_items: list) -> set[str]:
@@ -102,12 +155,201 @@ def _get_source_node_ids(evidence_items: list) -> set[str]:
     return ids
 
 
+def _is_complete_source(item) -> bool:
+    if getattr(item, "kind", "") != "source":
+        return False
+    if not getattr(item, "complete", False):
+        return False
+    payload = getattr(item, "payload", {})
+    if not isinstance(payload, dict):
+        return False
+    return bool(
+        getattr(item, "node_id", None)
+        and (getattr(item, "file", None) or payload.get("file"))
+        and (
+            getattr(item, "start_line", None) is not None
+            or payload.get("start_line") is not None
+        )
+        and (
+            getattr(item, "end_line", None) is not None
+            or payload.get("end_line") is not None
+        )
+        and payload.get("type")
+    )
+
+
+def _complete_sources_by_node(evidence_items: list) -> dict[str, object]:
+    return {
+        getattr(item, "node_id", ""): item
+        for item in evidence_items
+        if _is_complete_source(item)
+    }
+
+
+def _unresolved_draft_entities(
+    draft: str,
+    evidence_items: list,
+) -> list[str]:
+    if not draft:
+        return []
+    explicit_entities = set(
+        match.strip()
+        for match in re.findall(r"`([^`\n]+)`", draft)
+        if match.strip()
+    )
+    explicit_entities.update(
+        re.findall(
+            r"[A-Za-z0-9_./\\-]+(?:::[A-Za-z0-9_]+)+",
+            draft,
+        )
+    )
+    if not explicit_entities:
+        return []
+
+    known = set()
+    for item in evidence_items:
+        node_id = getattr(item, "node_id", "") or ""
+        if node_id:
+            known.add(node_id.lower())
+            known.add(node_id.split("::")[-1].lower())
+        for endpoint in (
+            getattr(item, "source_node_id", "") or "",
+            getattr(item, "target_node_id", "") or "",
+        ):
+            if endpoint:
+                known.add(endpoint.lower())
+                known.add(endpoint.split("::")[-1].lower())
+        payload = getattr(item, "payload", {})
+        if isinstance(payload, dict) and payload.get("name"):
+            known.add(str(payload["name"]).lower())
+    return sorted(
+        entity
+        for entity in explicit_entities
+        if (
+            entity.lower() not in known
+            and entity.split("::")[-1].lower() not in known
+        )
+    )
+
+
 def _get_high_conf_relations(evidence_items: list, min_conf: float = 0.45) -> list:
     return [
         e for e in evidence_items
         if getattr(e, "kind", "") == "relation"
         and (getattr(e, "confidence", None) or 0) >= min_conf
+        and bool(getattr(e, "strategy", None))
     ]
+
+
+def _relations_connect(
+    relations: list,
+    source_id: str,
+    target_id: str,
+) -> bool:
+    if not source_id or not target_id:
+        return False
+    adjacency: dict[str, set[str]] = {}
+    for relation in relations:
+        source = getattr(relation, "source_node_id", "") or ""
+        target = getattr(relation, "target_node_id", "") or ""
+        if not source or not target:
+            continue
+        adjacency.setdefault(source, set()).add(target)
+        adjacency.setdefault(target, set()).add(source)
+    queue = deque([source_id])
+    visited = {source_id}
+    while queue:
+        current = queue.popleft()
+        if current == target_id:
+            return True
+        for neighbor in adjacency.get(current, set()):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+    return False
+
+
+def _shared_source_verifies_entities(
+    source_items: list,
+    relations: list,
+    primary_anchors: list[dict],
+) -> bool:
+    if len(primary_anchors) < 2:
+        return False
+    entity_names = [
+        anchor.get("name", "").lower()
+        for anchor in primary_anchors
+        if anchor.get("name")
+    ]
+    primary_ids = {
+        anchor.get("id", "")
+        for anchor in primary_anchors
+    }
+    if len(entity_names) < 2:
+        return False
+    for item in source_items:
+        node_id = getattr(item, "node_id", "") or ""
+        if not node_id or node_id in primary_ids:
+            continue
+        payload = getattr(item, "payload", {})
+        if not isinstance(payload, dict):
+            continue
+        source_context = str(payload.get("source_context", "")).lower()
+        if not all(name in source_context for name in entity_names):
+            continue
+        if any(
+            node_id in {
+                getattr(relation, "source_node_id", "") or "",
+                getattr(relation, "target_node_id", "") or "",
+            }
+            and (
+                getattr(relation, "source_node_id", "") in primary_ids
+                or getattr(relation, "target_node_id", "") in primary_ids
+            )
+            for relation in relations
+        ):
+            return True
+    return False
+
+
+def _has_completed_negative_search(
+    query_plan: dict,
+    primary_anchor_ids: set[str],
+    max_depth: int,
+    min_confidence: float,
+) -> bool:
+    for record in query_plan.get("relation_expansions", []):
+        if record.get("status") != "completed":
+            continue
+        if record.get(
+            "relation_result_count",
+            record.get("result_count"),
+        ) != 0:
+            continue
+        if record.get("action") not in {
+            "call_paths",
+            "transitive_callers",
+            "transitive_callees",
+            "class_hierarchy",
+            "contextualize",
+        }:
+            continue
+        searched_ids = {
+            record.get("symbol", ""),
+            record.get("target", ""),
+        }
+        if primary_anchor_ids and not (
+            primary_anchor_ids & searched_ids
+        ):
+            continue
+        if int(record.get("max_depth", max_depth)) > max_depth:
+            continue
+        if float(record.get("min_confidence", 0.0)) < min_confidence:
+            continue
+        if not record.get("edge_types"):
+            continue
+        return True
+    return False
 
 
 class SufficiencyGate:
@@ -116,6 +358,12 @@ class SufficiencyGate:
     DEFAULT_MIN_CONFIDENCE = 0.45
     EXPANSION_MAX_DEPTH = 2
     MAX_AUTO_EXPANSIONS = 2
+
+    def recommended_anchor_count(self, question: str) -> int:
+        """返回首次预取应覆盖的主要实体数量。"""
+        if _has_keywords(question, _COMPARISON_KEYWORDS):
+            return 2
+        return 1
 
     def evaluate(
         self,
@@ -141,7 +389,9 @@ class SufficiencyGate:
         source_items = [e for e in evidence_items if getattr(e, "kind", "") == "source"]
         relation_items = [e for e in evidence_items if getattr(e, "kind", "") == "relation"]
         validated_anchors = _get_validated_anchor_ids(query_plan)
+        validated_anchor_items = _get_validated_anchors(query_plan)
         source_ids = _get_source_node_ids(evidence_items)
+        complete_sources = _complete_sources_by_node(evidence_items)
         anchors = query_plan.get("anchors", [])
 
         # ── 最低要求：至少一个 source 证据 ──
@@ -153,8 +403,18 @@ class SufficiencyGate:
             )
 
         is_comparison = _has_keywords(question, _COMPARISON_KEYWORDS)
-        is_relation = _has_keywords(question, _RELATION_KEYWORDS)
         is_inheritance = _has_keywords(question, _INHERITANCE_KEYWORDS)
+        is_instantiation = _has_keywords(
+            question,
+            _INSTANTIATION_KEYWORDS,
+        )
+        is_relation = (
+            _has_keywords(question, _RELATION_KEYWORDS)
+            or is_instantiation
+        )
+        is_negative_draft = bool(
+            draft and _has_keywords(draft, _NEGATIVE_KEYWORDS)
+        )
 
         # anchor 实体在 draft 中可定位（信息性，非阻断）
         if draft:
@@ -164,38 +424,65 @@ class SufficiencyGate:
             )
             if draft_entities > 0:
                 reasons.append(f"草稿中引用了 {draft_entities} 个锚点实体")
+            unresolved_entities = _unresolved_draft_entities(
+                draft,
+                evidence_items,
+            )
+            if unresolved_entities:
+                missing.append(
+                    "草稿中的代码实体无法在证据中定位: "
+                    + ", ".join(unresolved_entities)
+                )
 
         # ── 单实体解释 ──
         if not is_comparison and not is_relation and not is_inheritance:
             if validated_anchors:
                 reasons.append(f"{len(validated_anchors)} 个已验证锚点")
-                complete_sources = [
-                    e for e in source_items
-                    if getattr(e, "complete", False)
-                    and getattr(e, "node_id", None) in validated_anchors
-                ]
-                if complete_sources:
-                    reasons.append(f"{len(complete_sources)} 个锚点有完整源码")
+                primary_anchor = _get_primary_anchors(
+                    question,
+                    validated_anchor_items,
+                    limit=1,
+                )[0]
+                if primary_anchor.get("id") in complete_sources:
+                    reasons.append("主要锚点有完整源码")
                 else:
                     missing.append("锚点缺少完整源码")
-            elif source_items:
-                reasons.append(f"{len(source_items)} 个源码证据（无预取锚点）")
             else:
-                missing.append("缺少源码证据")
+                missing.append("单实体问题至少需要一个已验证锚点")
 
             if not missing:
                 return GateDecision(passed=True, reasons=reasons)
 
         # ── 多实体比较 ──
         if is_comparison:
-            source_count = len(source_items)
-            entity_names_in_sources = source_ids | {
-                getattr(e, "node_id", "") for e in source_items
+            primary_anchors = _get_primary_anchors(
+                question,
+                validated_anchor_items,
+                limit=2,
+            )
+            primary_ids = [
+                anchor.get("id", "")
+                for anchor in primary_anchors
+                if anchor.get("id")
+            ]
+            covered_primary_ids = {
+                node_id
+                for node_id in primary_ids
+                if node_id in complete_sources
             }
-            if source_count >= 2:
-                reasons.append(f"比较问题有 {source_count} 个实体的源码证据")
-            elif source_count == 1:
-                missing.append("比较问题需要至少 2 个实体的源码证据")
+            if (
+                len(primary_ids) >= 2
+                and len(covered_primary_ids) == len(set(primary_ids))
+            ):
+                reasons.append(
+                    f"比较问题的 {len(covered_primary_ids)} 个主要实体"
+                    "均有独立完整源码"
+                )
+            else:
+                missing.append(
+                    "比较问题需要至少 2 个已验证主要实体，"
+                    "且每个主要实体都有独立完整源码"
+                )
                 # 请求扩展：inspect 第二个候选锚点
                 second_anchor = None
                 for a in anchors:
@@ -210,21 +497,61 @@ class SufficiencyGate:
                             symbol=second_anchor.get("id", ""),
                             reason="比较问题缺少第二个实体的源码",
                         ))
-            else:
-                missing.append("比较问题需要至少 2 个实体的源码证据")
 
         # ── 继承关系 ──
         inherits_rels: list = []
         if is_inheritance:
+            primary_classes = [
+                anchor
+                for anchor in _get_primary_anchors(
+                    question,
+                    validated_anchor_items,
+                    limit=1,
+                )
+                if anchor.get("type") == "CLASS"
+            ]
+            primary_class_id = (
+                primary_classes[0].get("id", "")
+                if primary_classes
+                else ""
+            )
+            bounded_inheritance_search = (
+                is_negative_draft
+                and _has_completed_negative_search(
+                    query_plan,
+                    {primary_class_id} if primary_class_id else set(),
+                    self.EXPANSION_MAX_DEPTH,
+                    self.DEFAULT_MIN_CONFIDENCE,
+                )
+            )
             inherits_rels = [
                 e for e in relation_items
                 if getattr(e, "edge_type", "") == "INHERITS"
+                and primary_class_id in {
+                    getattr(e, "source_node_id", "") or "",
+                    getattr(e, "target_node_id", "") or "",
+                }
+                and isinstance(getattr(e, "payload", {}), dict)
+                and any(
+                    key in getattr(e, "payload", {})
+                    for key in (
+                        "hierarchy_item",
+                        "hierarchy_entry",
+                        "id",
+                    )
+                )
             ]
-            if inherits_rels:
+            if not primary_class_id:
+                missing.append("继承问题缺少已验证的主要类锚点")
+            elif primary_class_id not in complete_sources:
+                missing.append("继承问题的主要类缺少完整源码")
+            elif inherits_rels:
                 reasons.append(f"{len(inherits_rels)} 条继承关系证据")
+            elif bounded_inheritance_search:
+                reasons.append("已完成限定范围的类层次搜索")
             else:
                 missing.append("继承问题缺少类层次证据")
-                for a in anchors:
+                for a in validated_anchor_items:
                     if a.get("type") == "CLASS" and expansion_count < self.MAX_AUTO_EXPANSIONS:
                         ch_key = f"class_hierarchy:{a.get('id', '')}"
                         if ch_key not in expanded_relations:
@@ -241,21 +568,53 @@ class SufficiencyGate:
             high_conf_rels = _get_high_conf_relations(
                 evidence_items, self.DEFAULT_MIN_CONFIDENCE
             )
-            # 检查关系是否连接至少两个不同锚点/源实体
-            anchor_ids = {a.get("id", "") for a in anchors} | source_ids
-            connected_entities: set[str] = set()
-            for rel in high_conf_rels:
-                src = getattr(rel, "source_node_id", "") or ""
-                tgt = getattr(rel, "target_node_id", "") or ""
-                if src in anchor_ids:
-                    connected_entities.add(src)
-                if tgt in anchor_ids:
-                    connected_entities.add(tgt)
+            primary_anchors = _get_primary_anchors(
+                question,
+                validated_anchor_items or anchors,
+                limit=2,
+            )
+            primary_ids = [
+                anchor.get("id", "")
+                for anchor in primary_anchors
+                if anchor.get("id")
+            ]
+            bounded_negative_search = (
+                is_negative_draft
+                and _has_completed_negative_search(
+                    query_plan,
+                    set(primary_ids),
+                    self.EXPANSION_MAX_DEPTH,
+                    self.DEFAULT_MIN_CONFIDENCE,
+                )
+            )
+            if len(primary_ids) >= 2:
+                relation_satisfied = _relations_connect(
+                    high_conf_rels,
+                    primary_ids[0],
+                    primary_ids[1],
+                ) or _shared_source_verifies_entities(
+                    source_items,
+                    high_conf_rels,
+                    primary_anchors,
+                )
+            elif len(primary_ids) == 1:
+                relation_satisfied = any(
+                    primary_ids[0] in {
+                        getattr(relation, "source_node_id", "") or "",
+                        getattr(relation, "target_node_id", "") or "",
+                    }
+                    for relation in high_conf_rels
+                )
+            else:
+                relation_satisfied = False
 
-            if high_conf_rels and len(connected_entities) >= 2:
+            if relation_satisfied:
                 reasons.append(
-                    f"{len(high_conf_rels)} 条高置信度关系证据，"
-                    f"连接 {len(connected_entities)} 个锚点实体"
+                    f"{len(high_conf_rels)} 条高置信度关系证据连接主要实体"
+                )
+            elif bounded_negative_search:
+                reasons.append(
+                    "已完成带方向、边类型、深度和置信度阈值的限定搜索"
                 )
             else:
                 if not high_conf_rels:
@@ -264,31 +623,46 @@ class SufficiencyGate:
                     )
                 else:
                     missing.append(
-                        "关系证据未连接多个锚点实体，"
+                        "关系证据未连接问题中的主要实体，"
                         "需要共享调用者或跨实体路径"
                     )
-                # 请求扩展：call_paths 优先（共享调用者），再回退到单锚点 transitive_callers
-                if anchors and expansion_count < self.MAX_AUTO_EXPANSIONS:
+                # 请求扩展：共享调用者优先，再回退到调用路径或单锚点调用者
+                if primary_anchors and expansion_count < self.MAX_AUTO_EXPANSIONS:
                     func_anchors = [
-                        a for a in anchors
+                        a for a in primary_anchors
                         if a.get("type") in ("FUNCTION", "METHOD")
                     ]
-                    # 优先：两个锚点间的 call_paths
                     if len(func_anchors) >= 2:
                         src = func_anchors[0].get("id", "")
                         tgt = func_anchors[1].get("id", "")
-                        cp_key = f"call_paths:{src}:{tgt}"
-                        if cp_key not in expanded_relations:
+                        shared_key = f"shared_callers:{src}:{tgt}"
+                        if shared_key not in expanded_relations:
                             expansions.append(ExpansionRequest(
-                                action="call_paths",
+                                action="shared_callers",
                                 symbol=src,
                                 target=tgt,
                                 max_depth=self.EXPANSION_MAX_DEPTH,
-                                reason=f"关系问题缺少跨实体关系，扩展 {src} ↔ {tgt} 调用路径",
+                                reason=(
+                                    "关系问题缺少跨实体关系，"
+                                    f"查找 {src} 与 {tgt} 的共享调用者"
+                                ),
                                 edge_types=["CALLS"],
                             ))
+                        else:
+                            cp_key = f"call_paths:{src}:{tgt}"
+                            if cp_key not in expanded_relations:
+                                expansions.append(ExpansionRequest(
+                                    action="call_paths",
+                                    symbol=src,
+                                    target=tgt,
+                                    max_depth=self.EXPANSION_MAX_DEPTH,
+                                    reason=(
+                                        "未找到共享调用者，"
+                                        f"回退到 {src} → {tgt} 调用路径"
+                                    ),
+                                    edge_types=["CALLS"],
+                                ))
                     if not expansions:
-                        # 回退：单锚点传递调用者
                         for a in func_anchors:
                             tc_key = f"transitive_callers:{a.get('id', '')}"
                             if tc_key not in expanded_relations:
@@ -300,10 +674,44 @@ class SufficiencyGate:
                                     edge_types=["CALLS"],
                                 ))
                                 break
+                    if not expansions and is_instantiation:
+                        class_anchors = [
+                            anchor
+                            for anchor in validated_anchor_items
+                            if anchor.get("type") == "CLASS"
+                        ]
+                        if class_anchors:
+                            class_id = class_anchors[0].get("id", "")
+                            context_key = f"contextualize:{class_id}"
+                            if context_key not in expanded_relations:
+                                expansions.append(ExpansionRequest(
+                                    action="contextualize",
+                                    symbol=class_id,
+                                    max_depth=1,
+                                    reason=(
+                                        "实例化问题缺少直接关系证据，"
+                                        f"重新检查 {class_id} 的实例化来源"
+                                    ),
+                                    edge_types=["INSTANTIATED_BY"],
+                                ))
 
         # ── 否定结论检测 ──
-        if draft and _has_keywords(draft, {"no", "not", "none", "doesn't", "don't", "isn't"}):
-            if not relation_items and is_relation:
+        if is_negative_draft and is_relation:
+            primary_anchor_ids = {
+                anchor.get("id", "")
+                for anchor in _get_primary_anchors(
+                    question,
+                    validated_anchor_items or anchors,
+                    limit=2,
+                )
+                if anchor.get("id")
+            }
+            if not _has_completed_negative_search(
+                query_plan,
+                primary_anchor_ids,
+                self.EXPANSION_MAX_DEPTH,
+                self.DEFAULT_MIN_CONFIDENCE,
+            ):
                 scope_parts = []
                 if anchors:
                     scope_parts.append(f"查询目标: {', '.join(a.get('id','') for a in anchors[:2])}")

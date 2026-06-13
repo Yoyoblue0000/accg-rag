@@ -14,6 +14,7 @@ mini_agent/
   model.py        — LLM 接口：流式调用 + THOUGHT/ACTION 解析 + finish_reason 捕获
   graph_tool.py   — 图查询工具：9 种 action + EmbeddingRanker（磁盘缓存）
   environment.py  — 只读文件工具：read_file / list_dir
+  sufficiency.py  — FinishAction 解析、确定性证据充分性门控、受控扩展计划
 scripts/
   run_agent.py    — 单任务入口
   run_qa.py       — QA 批量评估入口（支持 --json、--id、即时写入）
@@ -21,6 +22,7 @@ scripts/
 tests/
   test_agent_model.py      — model 层解析测试（40 条）
   test_agent_graph_tool.py — 候选排序与预取测试
+  test_sufficiency.py      — P4 完成语义、门控与扩展测试
 ```
 
 ## 常用命令
@@ -60,20 +62,25 @@ FINAL: <最终答案>
 Agent.run(task)
   │
   ├─ 1. 建图 + EmbeddingRanker.build_index（首次慢，磁盘缓存加速）
-  ├─ 2. rank_candidates(task) → Top-8 语义候选注入 user 消息
+  ├─ 2. 级联检索候选 → 验证并预取 1-2 个主要锚点源码
   ├─ 3. ReAct 循环（max 15 步）
   │     └─ model.query() → THOUGHT/ACTION 解析 → 工具执行 → 证据收集
-  ├─ 4. 终止判断
-  │     ├─ FINAL 文本命中 → 合成
-  │     ├─ finish_reason="stop" 无工具 → 合成
-  │     └─ 无工具调用 → 合成（有证据时）
-  └─ 5. _synthesize()：ANSWER_PROMPT + 证据 → 独立 LLM 调用 → 最终答案
+  ├─ 4. 完成请求
+  │     ├─ FINAL 文本 → FinishAction(draft)
+  │     └─ finish_reason="stop" / 无工具 → 仅表示本轮传输结束
+  ├─ 5. SufficiencyGate 确定性检查
+  │     ├─ 通过 → _synthesize()
+  │     └─ 未通过 → 最多 2 次有界关系扩展并继续探索
+  └─ 6. _synthesize()：问题 + 账本证据 + 最新草稿 + 搜索范围 → 最终答案
 ```
 
 ## 关键设计
 
-- **finish_reason 停牌**：从 Ollama 流式响应捕获 `finish_reason`，作为 API 原生停牌信号（借鉴 OpenCode）
-- **FINAL 文本双保险**：正则 `FINAL[:\s]` 匹配冒号/换行/空格三种写法
+- **传输结束与任务完成分离**：`finish_reason="stop"` 不绕过证据门控
+- **FinishAction**：仅解析协议行 `FINAL: <draft>`，草稿独立保存且不作为事实证据
+- **SufficiencyGate**：按单实体、比较、调用/数据流、继承、实例化和否定结论执行确定性规则
+- **受控关系扩展**：最多 2 次、深度 ≤2、最低置信度 0.45，优先共享调用者并记录完整审计
+- **模型历史压缩**：移除被拒 FINAL，旧工具结果替换为证据 ID 和查询计划摘要
 - **EmbeddingRanker 磁盘缓存**：指纹校验，代码不变则直接从 `.accg/embeddings_*.pkl` 加载
 - **on_step 回调**：每步即时输出，不等全部完成后一次性打印
 - **两阶段合成**：Agent 收集证据 → `Model.generate()` 独立合成（ANSWER_PROMPT）
