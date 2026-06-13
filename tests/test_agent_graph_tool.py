@@ -253,7 +253,7 @@ def test_embedding_failure_returns_lexical_fallback(tmp_path):
     class _BrokenRanker:
         calls = 0
 
-        def build_index(self, graph):
+        def build_index(self, graph, summaries=None):
             self.calls += 1
             raise ConnectionError("ollama unavailable")
 
@@ -287,7 +287,7 @@ def test_embedding_failure_returns_lexical_fallback(tmp_path):
 
 def test_candidate_merge_preserves_retrieval_sources(tmp_path):
     class _Ranker:
-        def build_index(self, graph):
+        def build_index(self, graph, summaries=None):
             return None
 
         def rank(self, query, limit=12):
@@ -478,7 +478,7 @@ class _FinalModel:
 
 def test_agent_returns_result_when_embedding_is_unavailable(tmp_path):
     class _BrokenRanker:
-        def build_index(self, graph):
+        def build_index(self, graph, summaries=None):
             raise ConnectionError("ollama unavailable")
 
     graph = nx.MultiDiGraph()
@@ -735,6 +735,75 @@ def test_auto_expansion_error_is_not_recorded_as_completed(tmp_path):
     assert expansion["status"] == "failed"
     assert "graph query failed" in expansion["error"]
     assert query_plan.diagnostics
+
+
+def test_call_paths_expansion_contextualizes_path_nodes(tmp_path):
+    from mini_agent.query_plan import QueryPlan
+    from mini_agent.sufficiency import ExpansionRequest
+
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    for name in ("start", "middle", "target"):
+        (source_dir / f"{name}.py").write_text(
+            f"def {name}():\n"
+            f"    return '{name}'\n",
+            encoding="utf-8",
+        )
+
+    graph = nx.MultiDiGraph()
+    for name in ("start", "middle", "target"):
+        _add_symbol(
+            graph,
+            f"src/{name}.py::{name}",
+            NodeType.FUNCTION,
+            name,
+            f"src/{name}.py",
+        )
+        graph.nodes[f"src/{name}.py::{name}"]["end_line"] = 2
+    graph.add_edge(
+        "src/start.py::start",
+        "src/middle.py::middle",
+        edge_type=EdgeType.CALLS,
+        confidence=0.9,
+        strategy="test",
+    )
+    graph.add_edge(
+        "src/middle.py::middle",
+        "src/target.py::target",
+        edge_type=EdgeType.CALLS,
+        confidence=0.9,
+        strategy="test",
+    )
+
+    agent = Agent(
+        _FinalModel(),
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=_graph_tool(graph, tmp_path),
+    )
+    query_plan = QueryPlan(query="How does start reach target?")
+
+    observed = agent._execute_expansions(
+        [ExpansionRequest(
+            action="call_paths",
+            symbol="src/start.py::start",
+            target="src/target.py::target",
+            edge_types=["CALLS"],
+        )],
+        query_plan,
+    )
+
+    expansion = query_plan.relation_expansions[0]
+    assert expansion["expanded_node_ids"] == [
+        "src/start.py::start",
+        "src/middle.py::middle",
+        "src/target.py::target",
+    ]
+    assert expansion["source_evidence_ids"]
+    assert any(
+        item.kind == "source"
+        and item.node_id == "src/middle.py::middle"
+        for item in observed
+    )
 
 
 def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):

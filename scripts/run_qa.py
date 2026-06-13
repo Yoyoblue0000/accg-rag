@@ -201,6 +201,11 @@ def main():
         default=os.environ.get("RERANKER_MODEL", ""),
         help="重排小模型名（如 qwen2.5:7b），留空则不启用重排",
     )
+    parser.add_argument(
+        "--embedding-model",
+        default=os.environ.get("EMBEDDING_MODEL", "mxbai-embed-large"),
+        help="embedding 模型名（默认 mxbai-embed-large）",
+    )
     args = parser.parse_args()
 
     verbosity = min(args.verbose, 2)
@@ -217,6 +222,7 @@ def main():
     graph_tool = GraphTool(
         args.project_path,
         enable_embeddings=args.embedding and not args.no_embedding,
+        embedding_model=args.embedding_model,
     )
 
     reranker = None

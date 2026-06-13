@@ -490,6 +490,109 @@ class TestSufficiencyGateBasic:
             for item in decision.missing_requirements
         )
 
+    def test_relation_draft_mentions_choose_later_validated_anchors(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question=(
+                "What is the propagation path through the indentation "
+                "checking workflow?"
+            ),
+            evidence_items=[
+                _src("src/respace.py::_construct_alignment_whitespace"),
+                _src("src/rule.py::Rule::_get_indentation"),
+                _src("src/reindent.py::construct_single_indent"),
+                _rel(
+                    "CALLS",
+                    "src/rule.py::Rule::_get_indentation",
+                    "src/reindent.py::construct_single_indent",
+                    0.9,
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor(
+                        "src/respace.py::_construct_alignment_whitespace"
+                    ),
+                    _anchor("src/rule.py::Rule::_get_indentation"),
+                    _anchor("src/reindent.py::construct_single_indent"),
+                ],
+            },
+            draft=(
+                "`_get_indentation` obtains indentation through "
+                "`construct_single_indent`."
+            ),
+        )
+
+        assert decision.passed
+
+    def test_draft_identifier_present_in_source_is_locatable(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释 format_header 函数",
+            evidence_items=[
+                _src(
+                    "src/a.py::format_header",
+                    source_context=(
+                        "from io import StringIO\n"
+                        "def format_header():\n"
+                        "    buffer = StringIO()\n"
+                    ),
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor("src/a.py::format_header"),
+                ],
+            },
+            draft="The function builds its result with `StringIO`.",
+        )
+
+        assert decision.passed
+
+    def test_draft_parent_classes_are_locatable_in_nested_node_ids(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释两个方法如何协调",
+            evidence_items=[
+                _src(
+                    "src/config.py::FluffConfig::process_raw_file_for_config"
+                ),
+                _src("src/noqa.py::IgnoreMask::from_source"),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor(
+                        "src/config.py::FluffConfig::process_raw_file_for_config"
+                    ),
+                    _anchor("src/noqa.py::IgnoreMask::from_source"),
+                ],
+            },
+            draft="`FluffConfig` coordinates with `IgnoreMask`.",
+        )
+
+        assert decision.passed
+
+    def test_draft_literals_expressions_and_sql_phrases_are_not_entities(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="Where does StringLexer.search return a tuple or None?",
+            evidence_items=[
+                _src("src/lexer.py::StringLexer::search"),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor("src/lexer.py::StringLexer::search"),
+                ],
+            },
+            draft=(
+                "`forward_string.find(self.template)` returns a position or "
+                "`None`; the separate grammar phrase "
+                "`WHEN NOT MATCHED BY SOURCE` is syntax, not a code entity."
+            ),
+        )
+
+        assert decision.passed
+
     def test_negative_conclusion_needs_search_record(self):
         """否定关系结论应记录查询方向、边类型、深度和置信度阈值。"""
         gate = SufficiencyGate()
@@ -510,6 +613,36 @@ class TestSufficiencyGateBasic:
         assert any(
             "否定" in m or "关系" in m
             for m in decision.missing_requirements
+        )
+
+    def test_none_and_sql_not_do_not_create_negative_relation_claim(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="What calls parser?",
+            evidence_items=[
+                _src("src/a.py::parser"),
+                _rel(
+                    "CALLS",
+                    "src/a.py::caller",
+                    "src/a.py::parser",
+                    0.9,
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor("src/a.py::parser"),
+                ],
+            },
+            draft=(
+                "The caller handles `None` while parsing "
+                "`WHEN NOT MATCHED BY SOURCE`."
+            ),
+        )
+
+        assert decision.passed
+        assert not any(
+            "否定关系结论" in item
+            for item in decision.missing_requirements
         )
 
     def test_negative_conclusion_passes_after_bounded_search_is_recorded(self):
@@ -600,7 +733,7 @@ class _FakeItem:
         self.strategy = strategy
 
 
-def _src(node_id):
+def _src(node_id, source_context="pass"):
     file_path = node_id.split("::", 1)[0]
     return _FakeItem(
         "source",
@@ -615,7 +748,7 @@ def _src(node_id):
             "file": file_path,
             "start_line": 1,
             "end_line": 3,
-            "source_context": "pass",
+            "source_context": source_context,
         },
     )
 

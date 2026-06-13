@@ -142,6 +142,32 @@ def _collect_endpoint_node_ids(result_json: str) -> list[str]:
     return node_ids
 
 
+def _collect_path_node_ids(result_json: str) -> list[str]:
+    """从 call_paths 结果中提取完整路径节点，保持路径顺序并去重。"""
+    try:
+        data = json.loads(result_json)
+    except json.JSONDecodeError:
+        return []
+    entries = data if isinstance(data, list) else data.get(
+        "items",
+        data.get("results", []),
+    )
+    node_ids = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for node_id in entry.get("node_ids", []):
+            if (
+                isinstance(node_id, str)
+                and NodeId.has_symbol(node_id)
+                and node_id not in seen
+            ):
+                seen.add(node_id)
+                node_ids.append(node_id)
+    return node_ids
+
+
 SYSTEM_PROMPT = """
 你是一个代码分析 ReAct Agent。ACCG 已为当前项目构建了代码图，你可以在图结构和源码之间双向验证。用图定位"去哪读"，用源码验证"读到了什么"。
 
@@ -936,7 +962,14 @@ class Agent:
                         raw,
                         step=self.step_count,
                     )
-                    if req.action in (
+                    if req.action == "call_paths":
+                        expanded_node_ids = _collect_path_node_ids(raw)
+                        items.extend(
+                            self._contextualize_expansion_nodes(
+                                expanded_node_ids[:5],
+                            )
+                        )
+                    elif req.action in (
                         "transitive_callers",
                         "transitive_callees",
                     ):

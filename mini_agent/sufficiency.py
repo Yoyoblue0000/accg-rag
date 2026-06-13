@@ -85,10 +85,39 @@ _INSTANTIATION_KEYWORDS = {
     "instantiation", "instance", "constructor", "construct",
     "实例化", "创建实例", "构造",
 }
-_NEGATIVE_KEYWORDS = {
-    "no", "not", "none", "doesn't", "don't", "isn't",
-    "没有", "不存在", "无关系", "未发现", "找不到",
+_CODE_LITERALS = {
+    "none", "true", "false", "null", "nil",
+    "self", "cls",
 }
+_NEGATIVE_RELATION_PATTERNS = (
+    re.compile(
+        r"\bno\s+(?:(?:direct|indirect|bounded)\s+)?"
+        r"(?:caller|callers|callee|callees|call|calls|path|paths|"
+        r"relation|relationship|connection|subclass|subclasses|"
+        r"parent|parents|child|children|instance|instances|"
+        r"instantiation|instantiations)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno\s+code\s+"
+        r"(?:calls?|invokes?|inherits?|instantiates?|connects?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:does\s+not|doesn't|do\s+not|don't|is\s+not|isn't|"
+        r"was\s+not|wasn't|cannot|can't)\s+"
+        r"(?:directly\s+|indirectly\s+)?"
+        r"(?:call|called|invoke|invoked|inherit|inherited|instantiate|"
+        r"instantiated|connect|connected)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:没有|不存在|未发现|找不到).{0,12}"
+        r"(?:调用|调用者|被调用者|路径|关系|连接|继承|子类|父类|"
+        r"实例化|实例)"
+    ),
+    re.compile(r"无(?:调用|路径|关系|连接|继承|实例化)"),
+)
 
 
 def _has_keywords(text: str, keywords: set[str]) -> bool:
@@ -102,6 +131,10 @@ def _has_keywords(text: str, keywords: set[str]) -> bool:
         elif normalized in lowered:
             return True
     return False
+
+
+def _is_negative_relation_conclusion(draft: str) -> bool:
+    return any(pattern.search(draft) for pattern in _NEGATIVE_RELATION_PATTERNS)
 
 
 def _get_validated_anchor_ids(query_plan: dict) -> set[str]:
@@ -125,21 +158,33 @@ def _get_primary_anchors(
     question: str,
     anchors: list[dict],
     limit: int,
+    draft: str = "",
 ) -> list[dict]:
     if len(anchors) <= limit:
         return anchors
-    lowered = question.lower()
-    explicitly_named = [
-        anchor
-        for anchor in anchors
-        if (
-            anchor.get("id", "").lower() in lowered
-            or anchor.get("name", "").lower() in lowered
-        )
-    ]
-    if len(explicitly_named) >= limit:
-        return explicitly_named[:limit]
-    return anchors[:limit]
+
+    def mentions(text: str, anchor: dict) -> bool:
+        lowered = text.lower()
+        node_id = anchor.get("id", "").lower()
+        name = anchor.get("name", "").lower()
+        if node_id and node_id in lowered:
+            return True
+        if not name:
+            return False
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])",
+            lowered,
+        ))
+
+    ranked = sorted(
+        enumerate(anchors),
+        key=lambda pair: (
+            -int(mentions(question, pair[1])),
+            -int(bool(draft) and mentions(draft, pair[1])),
+            pair[0],
+        ),
+    )
+    return [anchor for _, anchor in ranked[:limit]]
 
 
 def _get_source_node_ids(evidence_items: list) -> set[str]:
@@ -207,27 +252,65 @@ def _unresolved_draft_entities(
         return []
 
     known = set()
+    source_contexts = []
     for item in evidence_items:
         node_id = getattr(item, "node_id", "") or ""
         if node_id:
             known.add(node_id.lower())
-            known.add(node_id.split("::")[-1].lower())
+            node_parts = node_id.split("::")
+            known.update(part.lower() for part in node_parts[1:] if part)
+            known.update(
+                "::".join(node_parts[index:]).lower()
+                for index in range(1, len(node_parts))
+            )
         for endpoint in (
             getattr(item, "source_node_id", "") or "",
             getattr(item, "target_node_id", "") or "",
         ):
             if endpoint:
                 known.add(endpoint.lower())
-                known.add(endpoint.split("::")[-1].lower())
+                endpoint_parts = endpoint.split("::")
+                known.update(
+                    part.lower()
+                    for part in endpoint_parts[1:]
+                    if part
+                )
         payload = getattr(item, "payload", {})
-        if isinstance(payload, dict) and payload.get("name"):
-            known.add(str(payload["name"]).lower())
+        if isinstance(payload, dict):
+            if payload.get("name"):
+                known.add(str(payload["name"]).lower())
+            source_context = payload.get("source_context")
+            if source_context:
+                source_contexts.append(str(source_context).lower())
+
+    def is_entity_reference(value: str) -> bool:
+        stripped = value.strip()
+        lowered = stripped.lower()
+        if not stripped or lowered in _CODE_LITERALS:
+            return False
+        if "::" in stripped:
+            return True
+        if any(char.isspace() for char in stripped):
+            return False
+        if re.search(r"[()[\]{}=,+*/%<>\"']", stripped):
+            return False
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", stripped))
+
+    def appears_in_source(value: str) -> bool:
+        lowered = value.lower()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            pattern = re.compile(rf"\b{re.escape(lowered)}\b")
+            return any(pattern.search(context) for context in source_contexts)
+        return any(lowered in context for context in source_contexts)
+
     return sorted(
         entity
         for entity in explicit_entities
         if (
-            entity.lower() not in known
+            is_entity_reference(entity)
+            and entity.lower() not in known
             and entity.split("::")[-1].lower() not in known
+            and not appears_in_source(entity)
         )
     )
 
@@ -413,7 +496,7 @@ class SufficiencyGate:
             or is_instantiation
         )
         is_negative_draft = bool(
-            draft and _has_keywords(draft, _NEGATIVE_KEYWORDS)
+            draft and _is_negative_relation_conclusion(draft)
         )
 
         # anchor 实体在 draft 中可定位（信息性，非阻断）
@@ -572,6 +655,7 @@ class SufficiencyGate:
                 question,
                 validated_anchor_items or anchors,
                 limit=2,
+                draft=draft if not is_comparison else "",
             )
             primary_ids = [
                 anchor.get("id", "")
@@ -703,6 +787,7 @@ class SufficiencyGate:
                     question,
                     validated_anchor_items or anchors,
                     limit=2,
+                    draft=draft if not is_comparison else "",
                 )
                 if anchor.get("id")
             }
