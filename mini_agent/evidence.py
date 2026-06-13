@@ -380,7 +380,17 @@ class EvidenceItem:
                 f"{c.get('name','?')}(conf={c.get('confidence','?')})" for c in inst[:5]))
         methods = p.get("methods", [])
         if methods:
-            lines.append(f"  方法 ({len(methods)} 个): " + ", ".join(m["name"] for m in methods[:8]))
+            method_strs = []
+            for m in methods[:8]:
+                summary = m.get("summary", "")
+                if summary:
+                    # 截断过长的摘要
+                    short = summary[:60] + "..." if len(summary) > 60 else summary
+                    method_strs.append(f"{m['name']}({short})")
+                else:
+                    method_strs.append(m["name"])
+            suffix = f" ...共 {len(methods)} 个" if len(methods) > 8 else ""
+            lines.append(f"  方法 ({len(methods)} 个): " + ", ".join(method_strs) + suffix)
         return lines
 
     # ── 工厂方法 ────────────────────────────────────────────

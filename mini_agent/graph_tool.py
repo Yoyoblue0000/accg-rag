@@ -386,32 +386,51 @@ class GraphTool:
 
     def _handle_calls_to(self, args: dict):
         min_conf = args.get("min_confidence", 0.45)
-        return self._query.calls_to_with_edges(args.get("symbol", ""), min_confidence=min_conf)
+        symbol = self._normalize_symbol_arg(args)
+        return self._query.calls_to_with_edges(symbol, min_confidence=min_conf)
 
     def _handle_calls_from(self, args: dict):
         min_conf = args.get("min_confidence", 0.45)
-        return self._query.calls_from_with_edges(args.get("symbol", ""), min_confidence=min_conf)
+        symbol = self._normalize_symbol_arg(args)
+        return self._query.calls_from_with_edges(symbol, min_confidence=min_conf)
+
+    @staticmethod
+    def _normalize_symbol_arg(args: dict) -> str:
+        """模型可能用 symbol / name / function_id / class_name，统一提取。"""
+        return (
+            args.get("symbol")
+            or args.get("name")
+            or args.get("function_id")
+            or args.get("class_name")
+            or ""
+        )
 
     def _handle_call_paths(self, args: dict):
         min_conf = args.get("min_confidence", 0.45)
         max_depth = args.get("max_depth", 3)
-        return self._query.call_paths(args.get("source", ""), args.get("target", ""),
+        source = self._normalize_symbol_arg({"symbol": args.get("source", "")})
+        target = self._normalize_symbol_arg({"symbol": args.get("target", "")})
+        return self._query.call_paths(source, target,
                                       max_depth=max_depth, min_confidence=min_conf)
 
     def _handle_transitive_callers(self, args: dict):
         min_conf = args.get("min_confidence", 0.45)
         max_depth = args.get("max_depth", 3)
-        return self._query.transitive_callers(args.get("symbol", ""), max_depth=max_depth,
+        symbol = self._normalize_symbol_arg(args)
+        return self._query.transitive_callers(symbol, max_depth=max_depth,
                                               min_confidence=min_conf)
 
     def _handle_transitive_callees(self, args: dict):
         min_conf = args.get("min_confidence", 0.45)
         max_depth = args.get("max_depth", 3)
-        return self._query.transitive_callees(args.get("symbol", ""), max_depth=max_depth,
+        symbol = self._normalize_symbol_arg(args)
+        return self._query.transitive_callees(symbol, max_depth=max_depth,
                                               min_confidence=min_conf)
 
     def _handle_class_hierarchy(self, args: dict):
-        class_name = args.get("class_name", "")
+        class_name = self._normalize_symbol_arg(args)
+        if not class_name:
+            return []
         simple_name = class_name.split("::")[-1]
         class_ids = []
         if class_name in self._graph.nodes:

@@ -52,6 +52,7 @@ class Anchor:
 @dataclass
 class QueryPlan:
     query: str
+    entities: list[dict] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     anchors: list[Anchor] = field(default_factory=list)
     rejected_anchors: list[dict] = field(default_factory=list)
@@ -63,6 +64,7 @@ class QueryPlan:
     def to_dict(self) -> dict:
         return {
             "query": self.query,
+            "entities": list(self.entities),
             "candidates": [
                 candidate.to_dict()
                 for candidate in self.candidates

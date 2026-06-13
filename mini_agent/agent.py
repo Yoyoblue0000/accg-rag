@@ -18,6 +18,8 @@ from .sufficiency import (
     GateDecision,
     SufficiencyGate,
 )
+from .entity_extractor import Entity, EntityExtractor
+from .multi_entity import MultiEntityOrchestrator
 from accg.models import NodeId
 
 
@@ -53,6 +55,7 @@ class RunResult:
     evidence_selection_report: str | None = None
     model_requests: list[dict] = field(default_factory=list)
     query_plan: dict | None = None
+    entities: list[dict] = field(default_factory=list)
     finish_draft: str | None = None
 
     @property
@@ -255,6 +258,7 @@ class Agent:
         on_step: Callable[["MsgRecord"], None] | None = None,
         on_audit: Callable[[str], None] | None = None,
         reranker=None,
+        entity_extractor: EntityExtractor | None = None,
     ):
         self.model = model
         self.env = env
@@ -273,6 +277,12 @@ class Agent:
         self.last_model_requests: list[dict] = []
         self._full_tool_results: dict[str, str] = {}
         self.last_query_plan: dict = {}
+        self._entity_extractor = entity_extractor
+        self._orchestrator = (
+            MultiEntityOrchestrator(graph_tool, reranker)
+            if graph_tool and entity_extractor
+            else None
+        )
         self._gate = SufficiencyGate()
         self._expansion_count = 0
         self._expanded_relations: set[str] = set()
@@ -298,8 +308,25 @@ class Agent:
         saved = copy.deepcopy(messages)
         full_tool_results = copy.deepcopy(self._full_tool_results)
 
+        # 精确统计上下文大小
+        total_chars = 0
+        cjk = 0
+        for msg in saved:
+            content = msg.get("content", "")
+            total_chars += len(content)
+            cjk += sum(1 for c in content if "一" <= c <= "鿿")
+            for tc in msg.get("tool_calls", []):
+                args = tc.get("function", {}).get("arguments", "")
+                total_chars += len(args)
+                cjk += sum(1 for c in args if "一" <= c <= "鿿")
+        est_tokens = (total_chars - cjk) // 4 + int(cjk / 1.5)
+
         # 人类可读输出
-        parts = [f"── 发给大模型的完整内容 | {stage} ──"]
+        parts = [
+            f"── 发给大模型的完整内容 | {stage} "
+            f"| msgs={len(saved)} chars={total_chars} "
+            f"est_tokens={est_tokens} ──"
+        ]
         for i, msg in enumerate(saved):
             role = msg.get("role", "?").upper()
             parts.append(f"\n消息 {i+1}/{len(saved)} | {role}")
@@ -357,12 +384,57 @@ class Agent:
             if not self.graph_tool.is_ready:
                 return RunResult(answer="", error="图工具未就绪")
 
-        # 预分析：确定性检索 + 可选 embedding 增强
+        # 预分析：实体提取 + 多实体检索 / 单检索
         prelude = ""
         candidates = []
         query_plan = QueryPlan(query=task)
         retrieval_started_at = time.perf_counter()
-        if self.graph_tool:
+
+        entities = []
+        use_multi_entity = False
+        if self._orchestrator and self.graph_tool:
+            entities = self._entity_extractor.extract(task)
+            query_plan.entities = [e.to_dict() for e in entities]
+            use_multi_entity = len(entities) > 1
+
+        if use_multi_entity:
+            prelude_result = self._orchestrator.run(
+                entities=entities,
+                task=task,
+                ledger=self._ledger,
+                recommended_count=self._gate.recommended_anchor_count(
+                    task, len(entities)
+                ),
+            )
+            prelude += "\n\n[候选符号] 以下按实体分别检索:\n"
+            prelude += prelude_result.text
+            query_plan.prefetch_evidence_ids = list(
+                prelude_result.prefetch_evidence_ids
+            )
+            for name, anchor_list in prelude_result.entity_anchors.items():
+                for anchor_data in anchor_list:
+                    anchor = Anchor.from_dict(anchor_data)
+                    anchor.validation = {
+                        "valid": True,
+                        "reason": "exact_contextualize_result",
+                    }
+                    anchor.evidence_ids = anchor_data.get("evidence_ids", [])
+                    anchor.display_level = anchor_data.get("display_level", "complete")
+                    anchor.omitted_reason = anchor_data.get("omitted_reason", "")
+                    query_plan.anchors.append(anchor)
+            query_plan.rejected_anchors = prelude_result.rejected_anchors
+            query_plan.diagnostics.extend(prelude_result.diagnostics)
+            query_plan.diagnostics.append(
+                f"多实体检索: {len(entities)} 个实体, "
+                f"{prelude_result.anchor_count} 个有效锚点"
+            )
+            self._retrieval_result = RetrievalResult(
+                candidates=[],
+                stages_attempted=[],
+                stages_succeeded=[],
+                diagnostics=["多实体路径，见 query_plan.entities"],
+            )
+        elif self.graph_tool:
             try:
                 search = getattr(self.graph_tool, "search", None)
                 if search is None:
@@ -710,6 +782,7 @@ class Agent:
                     retrieval=self._retrieval_result,
                     messages=list(self._trace),
                     query_plan=copy.deepcopy(self.last_query_plan),
+                    entities=list(query_plan.entities),
                     finish_draft=self._latest_finish_draft or None,
                 )
 
@@ -802,6 +875,7 @@ class Agent:
             retrieval=self._retrieval_result,
             messages=list(self._trace),
             query_plan=copy.deepcopy(self.last_query_plan),
+            entities=list(query_plan.entities),
             finish_draft=self._latest_finish_draft or None,
         )
 
@@ -1222,6 +1296,7 @@ class Agent:
                              retrieval=self._retrieval_result,
                              messages=list(self._trace),
                              query_plan=copy.deepcopy(self.last_query_plan),
+                             entities=list(self.last_query_plan.get("entities", [])),
                              finish_draft=self._latest_finish_draft or None)
 
         # 从账本选择证据（预算内，逐项等级）
@@ -1234,6 +1309,7 @@ class Agent:
                              retrieval=self._retrieval_result,
                              messages=list(self._trace),
                              query_plan=copy.deepcopy(self.last_query_plan),
+                             entities=list(self.last_query_plan.get("entities", [])),
                              finish_draft=self._latest_finish_draft or None)
 
         prompt = (
@@ -1262,6 +1338,7 @@ class Agent:
             evidence_selection_report=selection_report,
             model_requests=copy.deepcopy(self.last_model_requests),
             query_plan=copy.deepcopy(self.last_query_plan),
+            entities=list(self.last_query_plan.get("entities", [])),
             finish_draft=self._latest_finish_draft or None,
         )
 

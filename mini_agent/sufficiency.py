@@ -496,8 +496,10 @@ class SufficiencyGate:
     def __init__(self, config: GateConfig | None = None):
         self._gate_config = config or GateConfig()
 
-    def recommended_anchor_count(self, question: str) -> int:
+    def recommended_anchor_count(self, question: str, entity_count: int = 0) -> int:
         """返回首次预取应覆盖的主要实体数量。"""
+        if entity_count >= 2:
+            return entity_count
         if _has_keywords(question, _COMPARISON_KEYWORDS):
             return 2
         return 1
