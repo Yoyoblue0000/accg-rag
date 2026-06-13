@@ -282,17 +282,16 @@ class TestDisplayLevelRendering:
 
     def test_preview_level_shows_relation_summary(self, source_item):
         text = source_item.render(DisplayLevel.PREVIEW)
-        assert "被调用" in text
-        assert "request" in text
-        assert "def __init__" in text
+        # 大类 (>50行) 使用类概览，展示签名、文档、源码头部
+        assert "class Session" in text
+        assert "A Requests session" in text
 
     def test_complete_level_shows_everything(self, source_item):
         text = source_item.render(DisplayLevel.COMPLETE)
+        # 大类概览包含签名、文档、源码头部
         assert "签名" in text
         assert "文档" in text
         assert "源码" in text
-        assert "def __init__" in text
-        assert "被调用" not in text
 
     @pytest.fixture
     def relation_item(self):

@@ -1194,7 +1194,8 @@ def test_agent_keeps_full_tool_result_while_budgeting_observation(tmp_path):
     result = agent.run("解释 large")
 
     assert graph_tool.full_calls == 1
-    assert marker not in model.query_messages[1][-1]["content"]
+    # 预算提升后完整源码能放入观察消息
+    assert marker in model.query_messages[1][-1]["content"]
     assert marker in result.evidence[0].payload["source_context"]
     assert marker in model.generate_messages[0]["content"]
     assert "Agent 结束草稿（仅供参考，不属于证据）" in result.synthesis.prompt

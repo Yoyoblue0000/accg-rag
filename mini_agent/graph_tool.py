@@ -602,6 +602,9 @@ class GraphTool:
                     init_id = v
 
         if methods:
+            summaries = self._load_summary_index()
+            for m in methods:
+                m["summary"] = summaries.get(m["id"], "")
             entry["methods"] = methods
 
         # 收集本类及所有子类的 CLASS 调用者
@@ -796,11 +799,8 @@ class GraphTool:
             node_type
             for _, node_type in sorted(explicit_type_positions)
         ]
-        preferred_types.extend(
-            node_type
-            for node_type in ("FUNCTION", "CLASS", "METHOD")
-            if node_type not in preferred_types
-        )
+        # 仅当 query 显式提到类型才加入，未提及时传空列表，
+        # 由 select_query_anchors 按分数驱动选择，避免 FUNCTION > METHOD 等硬编码偏好
         comparison_query = bool(re.search(
             r"\b(compare|comparison|between|relationship|difference|"
             r"versus|vs)\b",

@@ -10,19 +10,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 mini_agent/
-  agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT、收敛分析
-  model.py        — LLM 接口：流式调用 + THOUGHT/ACTION 解析 + finish_reason 捕获
-  graph_tool.py   — 图查询工具：9 种 action + EmbeddingRanker（磁盘缓存）
-  environment.py  — 只读文件工具：read_file / list_dir
-  sufficiency.py  — FinishAction 解析、确定性证据充分性门控、受控扩展计划
+  agent.py         — ReAct 循环、SYSTEM_PROMPT/ANSWER_PROMPT、锚点预取、扩展执行、消息压缩
+  model.py         — LLM 接口：流式调用 + THOUGHT/ACTION/FINAL 解析 + finish_reason 捕获
+  graph_tool.py    — 图查询工具：9 种 action + EmbeddingRanker（摘要向量增强 + 磁盘缓存）
+  retrieval.py     — 5 阶段级联检索 + 候选排序 + 锚点选择 + RetrievalConfig 可配置参数
+  sufficiency.py   — FinishAction 解析、确定性证据充分性门控、受控扩展计划、GateConfig
+  evidence.py      — 证据账本：分层展示（COMPLETE/PREVIEW/SNIPPET/FOLD）、预算控制、合成选择
+  environment.py   — 只读文件工具：read_file / list_dir
+  query_plan.py    — 查询计划与锚点数据结构
+  retrieval_metrics.py — 检索评估：临时 gold 提取、recall/MRR/NDCG、锚点 PR/type coverage
+  reranker.py      — 可选在线重排器（小模型二次排序候选人）
 scripts/
-  run_agent.py    — 单任务入口
-  run_qa.py       — QA 批量评估入口（支持 --json、--id、即时写入）
-  analyze_candidates.py — embedding 候选相关性分析
+  run_agent.py          — 单任务入口
+  run_qa.py             — QA 批量评估（支持 --json、--id、--embedding、即时写入）
+  build_summary_index.py — 离线 7B 摘要索引构建（用于 embedding 增强）
 tests/
-  test_agent_model.py      — model 层解析测试（40 条）
-  test_agent_graph_tool.py — 候选排序与预取测试
-  test_sufficiency.py      — P4 完成语义、门控与扩展测试
+  test_agent_model.py      — model 层解析测试
+  test_agent_graph_tool.py — 候选排序、锚点选择、预取、扩展、合成测试
+  test_sufficiency.py      — 门控通过/拒绝、实体过滤、否定语义测试
+  test_query_plan.py       — 锚点选择排序、验证、预取预算测试
+  test_retrieval_metrics.py — gold 提取、检索指标计算测试
 ```
 
 ## 常用命令
@@ -31,22 +38,38 @@ tests/
 # 安装
 uv venv && uv pip install -e .
 
-# Agent 单任务
+# 本地单题测试
 .venv/Scripts/python.exe scripts/run_agent.py "问题描述"
 
-# QA 批量评估（服务器）
-~/.local/bin/uv run python scripts/run_qa.py \
-  --project-path ~/program/test_repos/requests_repo \
-  --qa-path ~/program/test_repos/sweqa_requests.json \
-  --model qwen2.5-coder:14b-instruct --limit 20
+# 运行全部测试（162 条）
+.venv/Scripts/python.exe -m pytest tests/ -v
 
-# 运行 Agent 测试
-.venv/Scripts/python.exe -m pytest tests/test_agent_model.py -v
+# 运行单个测试文件
+.venv/Scripts/python.exe -m pytest tests/test_sufficiency.py -v
+
+# 服务器：QA 批量测试（32B + embedding）
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && .venv/bin/python scripts/run_qa.py \
+  --project-path ~/program/sqlfluff_repo \
+  --qa-path /home/amd-jk6kg8k/program/sqlfluff_qa.json \
+  --model qwen2.5-coder:32b --embedding --id 1 2 7 --output /tmp/qa_p4.json"
+
+# 服务器：仅跑指定题目
+ssh ... --id 1 2 7 33 42 --output /tmp/qa_p4_fixed.json
 ```
+
+## 模型默认值
+
+| 组件 | 默认 | 覆盖参数 |
+|------|------|---------|
+| LLM | `qwen2.5-coder:14b-instruct` | `--model` / `OLLAMA_MODEL` |
+| Embedding | `mxbai-embed-large`（334M） | `--embedding-model` / `EMBEDDING_MODEL` |
+| 重排 | 不启用 | `--reranker-model` / `RERANKER_MODEL` |
+
+Embedding 需显式传 `--embedding` 才会启用，否则仅走确定性检索（exact_id → exact_symbol → lexical → fuzzy）。
 
 ## 协议
 
-纯文本 ReAct 协议，非 OpenAI function calling。LLM 输出：
+纯文本 ReAct，非 OpenAI function calling。LLM 输出：
 
 ```
 THOUGHT: <推理>
@@ -54,7 +77,7 @@ ACTION: {"name": "<工具名>", "arguments": {<参数>}}
 FINAL: <最终答案>
 ```
 
-无依赖时可并行写多个 ACTION（最多 2 个）。model.py 解析层将图操作自动包装为 `query_graph(action=..., ...)`。
+无依赖时可并行写多个 ACTION（最多 2 个）。model.py 将图操作自动包装为 `query_graph(action=..., ...)`。
 
 ## 核心流程
 
@@ -62,106 +85,94 @@ FINAL: <最终答案>
 Agent.run(task)
   │
   ├─ 1. 建图 + EmbeddingRanker.build_index（首次慢，磁盘缓存加速）
-  ├─ 2. 级联检索候选 → 验证并预取 1-2 个主要锚点源码
-  ├─ 3. ReAct 循环（max 15 步）
+  ├─ 2. 5 阶段级联检索候选 → 锚点选择（分数驱动，类型仅平局打破）
+  ├─ 3. 验证锚点 → 预取源码 → 构建系统提示
+  ├─ 4. ReAct 循环（max 15 步）
   │     └─ model.query() → THOUGHT/ACTION 解析 → 工具执行 → 证据收集
-  ├─ 4. 完成请求
+  ├─ 5. 完成请求
   │     ├─ FINAL 文本 → FinishAction(draft)
   │     └─ finish_reason="stop" / 无工具 → 仅表示本轮传输结束
-  ├─ 5. SufficiencyGate 确定性检查
+  ├─ 6. SufficiencyGate 确定性检查
   │     ├─ 通过 → _synthesize()
   │     └─ 未通过 → 最多 2 次有界关系扩展并继续探索
-  └─ 6. _synthesize()：问题 + 账本证据 + 最新草稿 + 搜索范围 → 最终答案
+  └─ 7. _synthesize()：问题 + 完整证据 + 最新草稿 + 搜索范围 → 最终答案
 ```
 
 ## 关键设计
 
-- **传输结束与任务完成分离**：`finish_reason="stop"` 不绕过证据门控
-- **FinishAction**：仅解析协议行 `FINAL: <draft>`，草稿独立保存且不作为事实证据
-- **SufficiencyGate**：按单实体、比较、调用/数据流、继承、实例化和否定结论执行确定性规则
-- **受控关系扩展**：最多 2 次、深度 ≤2、最低置信度 0.45，优先共享调用者并记录完整审计
+- **传输结束 ≠ 任务完成**：`finish_reason="stop"` 不绕过证据门控
+- **锚点选择分数驱动**：候选按实际匹配分数排序，类型（FUNCTION/CLASS/METHOD）仅在同分时打破平局，不再是硬编码优先级
+- **SufficiencyGate**：按单实体、比较、调用/数据流、继承、实例化和否定结论执行确定性规则；Gate 实体过滤排除工具名、代码字面量、表达式片段，`::` 实体需各部分在同一源码中验证
+- **受控关系扩展**：最多 2 次、深度 ≤2、最低置信度 0.45，记录完整审计（source_evidence_ids）
+- **证据展示 COMPLETE 优先**：探索阶段源码先尝试完整展示（COMPLETE），预算不够再降级到 PREVIEW/SNIPPET/FOLD，避免模型看不到完整内容而重复请求
 - **模型历史压缩**：移除被拒 FINAL，旧工具结果替换为证据 ID 和查询计划摘要
-- **EmbeddingRanker 磁盘缓存**：指纹校验，代码不变则直接从 `.accg/embeddings_*.pkl` 加载
-- **on_step 回调**：每步即时输出，不等全部完成后一次性打印
-- **两阶段合成**：Agent 收集证据 → `Model.generate()` 独立合成（ANSWER_PROMPT）
+- **EmbeddingRanker 磁盘缓存**：指纹校验（含摘要文本），代码不变则直接加载 `.accg/embeddings_*.pkl`
+- **摘要向量增强**：离线 7B 模型生成函数英文一行摘要，作为 embedding 输入文本
+- **CJK 分词**：`tokenize()` 提取中文单字参与检索，中文查询不再被丢弃
+- **RetrievalConfig / GateConfig**：检索分数/权重/乘数和门控阈值集中为可配置 dataclass
 - **重复调用拦截**：最近 5 条 action 去重 + contextualize 符号去重
 - **收敛分析**：≥3 个不同 via_class 时自动附加汇聚提示
 
-## 工具一览
+## 5 阶段级联检索
 
-| 工具 | 类型 | 说明 |
-|---|---|---|
-| contextualize | query_graph | 一次返回源码 + calls/called_by + inherits + instantiated_by |
-| narrow_down | query_graph | 基于线索精简候选 |
-| extract_clues | query_graph | 从源码提取可定位符号 |
-| transitive_callers | query_graph | 传递调用者 |
-| transitive_callees | query_graph | 传递被调用者 |
-| call_paths | query_graph | 调用路径 |
-| class_hierarchy | query_graph | 类继承层次 |
-| module_tree | query_graph | 目录树 |
-| module_structure | query_graph | 模块结构 |
-| read_file | 文件 | 读文件（支持行号和上下文窗口） |
-| list_dir | 文件 | 列出目录内容 |
+| 阶段 | 基础分 | 说明 |
+|------|--------|------|
+| exact_id | 1000 | 精确 Node ID 匹配 |
+| exact_symbol | 900 × 类别乘数 | 精确符号名匹配 |
+| lexical | 100 + BM25F | 字段加权词匹配（summary 权重最高 5.0） |
+| embedding | 80 + cos×80 | 语义向量相似度 |
+| fuzzy | 10 + score×20 | 字符串模糊匹配回退 |
+
+同一候选多阶段命中时分数叠加。候选按分数降序排列，源码优先于文档/测试。
 
 ## 服务器验证
 
-Agent 依赖 Ollama 进行 LLM 推理和 embedding，本地 GPU 有限，所有 QA 批量测试必须在服务器上验证。
+依赖 Ollama，本地 GPU 有限，QA 批量测试在服务器上执行。
 
 ### 服务器环境
 
 | 项目 | 详情 |
-|---|---|
+|------|------|
 | 地址 | `ssh amd-jk6kg8k@10.67.8.138`（密钥 `~/.ssh/id_ed25519`） |
-| 硬件 | AMD Ryzen AI MAX+ 395，128GB 统一内存，Radeon 8060S GPU（gfx1151） |
-| Python | `~/.local/bin/uv run python` |
+| 硬件 | AMD Ryzen AI MAX+ 395，128GB 统一内存，Radeon 8060S（gfx1151） |
+| Python | `.venv/bin/python` |
 | Ollama API | `http://localhost:11434/v1` |
-| GPU 驱动 | ROCm 7.2.3，amdgpu 6.16.13 |
-| 可用显存 | ~111.5 GiB（统一内存架构） |
+| GPU 驱动 | ROCm 7.2.3 |
 
 ### GPU 模型兼容性
 
 ⚠️ **Qwen3 全系（含 MoE）在 gfx1151 上输出为空，不可用。**
 
 | 模型 | 架构 | GPU | 速度 | 备注 |
-|---|---|---|---|---|
-| qwen2.5-coder:14b | Dense 14.8B | ✅ | 19 t/s | **当前默认** |
+|------|------|-----|------|------|
+| qwen2.5-coder:14b-instruct | Dense 14.8B | ✅ | 19 t/s | 当前默认 |
+| qwen2.5-coder:32b (Q4_K_M) | Dense 32.8B | ✅ | ~4.5 t/s | 高质量，慢 |
 | qwen2.5:72b | Dense 72.7B | ✅ | 4.5 t/s | 太慢，不适合批量 |
-| qwen2.5:14b | Dense 14.8B | ✅ | ~20 t/s | 通用版 |
 | qwen3:30b | MoE 30.5B | ❌ | — | GPU 输出为空 |
-| nomic-embed-text | 137M | ✅ | 15ms | Embedding，必须保留 |
+| mxbai-embed-large | 334M | ✅ | ~15ms | Embedding 推荐 |
+| nomic-embed-text | 137M | ✅ | 15ms | 备选 embedding |
 
-### 同步+验证流程
+### 同步流程
 
 ```bash
-# 增量同步：打包 → 上传 → 解压 → 安装
-tar czf /tmp/accg_sync.tar.gz --exclude='.venv' --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' .
+# 打包（排除无关目录）
+tar czf /tmp/accg_sync.tar.gz \
+  --exclude='.venv' --exclude='.git' --exclude='__pycache__' \
+  --exclude='*.pyc' --exclude='.pytest_cache' --exclude='.pytest-tmp*' \
+  --exclude='.tmp' --exclude='output' --exclude='handoff' --exclude='test_repos' .
+
+# 上传 + 解压 + 安装
 scp -i ~/.ssh/id_ed25519 /tmp/accg_sync.tar.gz amd-jk6kg8k@10.67.8.138:~/program/accg-rag/
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e . && echo SYNC_OK"
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && rm -rf output handoff test_repos .pytest-tmp* .tmp 2>/dev/null; tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e . && echo SYNC_OK"
 
-# QA 全量（静默，仅输出汇总表）
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
-  --project-path ~/program/test_repos/requests_repo \
-  --qa-path ~/program/test_repos/sweqa_requests.json \
-  --model qwen2.5-coder:14b-instruct --limit 20"
-
-# QA 单题 + verbose（调试用）
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
-  --project-path ~/program/test_repos/requests_repo \
-  --qa-path ~/program/test_repos/sweqa_requests.json \
-  --model qwen2.5-coder:14b-instruct --id 1 -v"
-
-# 查看 GPU 状态
-ssh amd-jk6kg8k@10.67.8.138 "rocm-smi"
-# 查看 Ollama 推理日志
-ssh amd-jk6kg8k@10.67.8.138 "journalctl -u ollama --no-pager --since '2 min ago'"
-# 查看 QA 进度
-ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_results.json | python3 -c 'import json; d=json.load(open(\"/tmp/qa_results.json\")); print(len(d), \"done\")'"
+# 查看进度
+ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_p4_fixed2.json | python3 -c 'import json; d=json.load(open(\"/tmp/qa_p4_fixed2.json\")); print(len(d), \"done\")'"
 ```
 
-### 常见问题排查
+### 常见问题
 
 | 症状 | 可能原因 | 解决 |
-|---|---|---|
+|------|---------|------|
 | QA 进程卡住 | 前次残留进程抢 GPU | `pkill -f run_qa.py` |
 | 输出全为空 | 用了 qwen3 系列 | 换 `--model qwen2.5-coder:14b-instruct` |
 | embedding 极慢 | 多模型抢 VRAM | `sudo systemctl restart ollama` |
@@ -173,3 +184,4 @@ ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_results.json | python3 -c 'import json;
 - BFS 队列必须使用 `collections.deque`
 - 集合成员检查使用 `set`，禁止对列表做 `in` 扫描
 - 删除代码时同步清理相关的 import 和注释
+- 新增可调参数通过 config dataclass（`RetrievalConfig`/`GateConfig`）暴露，不直接写模块级常量

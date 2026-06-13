@@ -53,10 +53,10 @@ class Environment:
                 begin = max(0, begin - context)
         elif start_line:
             begin = max(0, start_line - 1)
-            end = min(total, begin + 30)
+            end = min(total, begin + 50)
         else:
             begin = 0
-            end = min(total, 200)
+            end = min(total, 500)
 
         result = [f"[{path} 行 {begin+1}-{end} / 共 {total} 行]"]
         for i in range(begin, end):

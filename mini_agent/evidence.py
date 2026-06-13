@@ -125,10 +125,15 @@ class EvidenceItem:
         if not sc and isinstance(self.payload, str):
             sc = self.payload
 
+        line_count = (el - sl + 1) if sl and el else 0
+        large_class = nt == "CLASS" and line_count > 50
+
         if level == DisplayLevel.FOLD:
             return f"[{nt}] {name} ({f}:{sl}-{el})"
 
         if level == DisplayLevel.SNIPPET:
+            if large_class:
+                return self._render_class_overview(p, name, nt, f, sl, el, sig, doc, sc, max_source=20)
             lines = [f"[{nt}] {name} ({f}:{sl}-{el})"]
             if sig:
                 lines.append(f"  签名: {sig}")
@@ -140,6 +145,8 @@ class EvidenceItem:
             return "\n".join(lines)
 
         if level == DisplayLevel.PREVIEW:
+            if large_class:
+                return self._render_class_overview(p, name, nt, f, sl, el, sig, doc, sc, max_source=30)
             lines = [f"[{nt}] {name} ({f}:{sl}-{el})"]
             if sig:
                 lines.append(f"  签名: {sig}")
@@ -157,6 +164,8 @@ class EvidenceItem:
             return "\n".join(lines)
 
         # COMPLETE
+        if large_class:
+            return self._render_class_overview(p, name, nt, f, sl, el, sig, doc, sc, max_source=40)
         lines = [f"[{nt}] {name} ({f}:{sl}-{el})"]
         lines.append(self._provenance_line())
         if sig:
@@ -165,6 +174,76 @@ class EvidenceItem:
             lines.append(f"  文档: {doc.strip()}")
         if sc:
             lines.append(f"  源码:\n{sc}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_class_overview(
+        p: dict,
+        name: str, nt: str, f: str,
+        sl: int, el: int,
+        sig: str, doc: str, sc: str,
+        max_source: int = 30,
+    ) -> str:
+        """大类结构化视图：方法清单含摘要 + 关系，不展示完整源码。"""
+        lines = [f"[{nt}] {name} ({f}:{sl}-{el})"]
+        if sig:
+            lines.append(f"  签名: {sig}")
+        if doc:
+            lines.append(f"  文档: {doc.strip()}")
+
+        methods = p.get("methods", [])
+        if methods:
+            lines.append(f"\n  方法 ({len(methods)} 个):")
+            for m in methods[:20]:
+                m_name = m.get("name", "?")
+                m_summary = m.get("summary", "")
+                if m_summary:
+                    lines.append(f"    {m_name} — {m_summary}")
+                else:
+                    lines.append(f"    {m_name}")
+            if len(methods) > 20:
+                lines.append(f"    ... 共 {len(methods)} 个方法，用 contextualize 查看具体方法")
+
+        # 继承和实例化关系
+        inherits = p.get("inherits", [])
+        if inherits:
+            for h in inherits:
+                htype = h.get("type", "?")
+                items = h.get("items", [])
+                if not items:
+                    continue
+                item_names = [
+                    hi.get("name", str(hi)) if isinstance(hi, dict) else str(hi)
+                    for hi in items[:8]
+                ]
+                if len(items) > 8:
+                    item_names.append(f"...共 {len(items)} 个")
+                label = {"parents": "父类", "children": "子类"}.get(htype, htype)
+                lines.append(f"\n  继承 - {label}: {', '.join(item_names)}")
+
+        instantiated_by = p.get("instantiated_by", [])
+        if instantiated_by:
+            caller_names = []
+            for c in instantiated_by[:8]:
+                via = c.get("via_class", "")
+                cname = c.get("name", "?")
+                if via:
+                    caller_names.append(f"{cname} (via {via})")
+                else:
+                    caller_names.append(cname)
+            if len(instantiated_by) > 8:
+                caller_names.append(f"...共 {len(instantiated_by)} 个")
+            lines.append(f"\n  被实例化: {', '.join(caller_names)}")
+
+        if methods:
+            lines.append("\n  提示: 用 contextualize 查看具体方法的完整源码")
+
+        if sc:
+            sc_lines = sc.split("\n")
+            if len(sc_lines) > max_source:
+                sc = "\n".join(sc_lines[:max_source]) + "\n[...类定义头部，完整方法用 contextualize 查看]"
+            lines.append(f"\n  源码 (头 {min(len(sc_lines), max_source)} 行):\n{sc}")
+
         return "\n".join(lines)
 
     def _render_relation(self, level: DisplayLevel) -> str:
@@ -683,8 +762,8 @@ class _SelectionEntry:
 class EvidenceLedger:
     """结构化证据账本：去重、分级展示、合成选择、审计输出。"""
 
-    SYNTHESIS_CHAR_BUDGET = 12000
-    OBSERVATION_CHAR_BUDGET = 8000
+    SYNTHESIS_CHAR_BUDGET = 24000
+    OBSERVATION_CHAR_BUDGET = 16000
 
     def __init__(self):
         self._items: list[EvidenceItem] = []
@@ -1057,6 +1136,7 @@ class EvidenceLedger:
                 continue
             if item.kind == "source":
                 levels = [
+                    DisplayLevel.COMPLETE,
                     DisplayLevel.PREVIEW,
                     DisplayLevel.SNIPPET,
                     DisplayLevel.FOLD,
@@ -1109,6 +1189,7 @@ class EvidenceLedger:
 
             if large_class:
                 levels = [
+                    DisplayLevel.COMPLETE,
                     DisplayLevel.PREVIEW,
                     DisplayLevel.SNIPPET,
                     DisplayLevel.FOLD,
@@ -1136,22 +1217,15 @@ class EvidenceLedger:
                     chosen_text = candidate
                     break
 
-            if (
-                not large_class
-                and chosen_level != DisplayLevel.COMPLETE
-            ):
-                omitted_reason = "单锚点展示预算不足"
-            elif large_class:
-                if chosen_level == DisplayLevel.PREVIEW:
-                    omitted_reason = "大型类使用 preview"
-                elif chosen_level == DisplayLevel.SNIPPET:
-                    omitted_reason = (
-                        "大型类超出 preview 预算，降级为 snippet"
-                    )
+            if chosen_level != DisplayLevel.COMPLETE:
+                if large_class and chosen_level == DisplayLevel.PREVIEW:
+                    omitted_reason = "大型类超出 COMPLETE 预算，降级为 preview"
+                elif large_class and chosen_level == DisplayLevel.SNIPPET:
+                    omitted_reason = "大型类超出 preview 预算，降级为 snippet"
+                elif large_class:
+                    omitted_reason = "大型类超出 snippet 预算，降级为 fold"
                 else:
-                    omitted_reason = (
-                        "大型类超出 snippet 预算，降级为 fold"
-                    )
+                    omitted_reason = "单锚点展示预算不足"
             if len(chosen_text) > max(0, budget - used):
                 chosen_text = item.render(DisplayLevel.FOLD)
                 chosen_level = DisplayLevel.FOLD

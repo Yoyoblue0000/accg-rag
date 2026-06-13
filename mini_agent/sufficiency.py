@@ -477,12 +477,24 @@ def _has_completed_negative_search(
     return False
 
 
+@dataclass
+class GateConfig:
+    """证据充分性门控的可配置参数。"""
+
+    min_confidence: float = 0.45
+    expansion_max_depth: int = 2
+    max_auto_expansions: int = 2
+
+
 class SufficiencyGate:
     """确定性证据充分性门控。"""
 
     DEFAULT_MIN_CONFIDENCE = 0.45
     EXPANSION_MAX_DEPTH = 2
     MAX_AUTO_EXPANSIONS = 2
+
+    def __init__(self, config: GateConfig | None = None):
+        self._gate_config = config or GateConfig()
 
     def recommended_anchor_count(self, question: str) -> int:
         """返回首次预取应覆盖的主要实体数量。"""
@@ -614,7 +626,7 @@ class SufficiencyGate:
                     if a.get("id") not in source_ids:
                         second_anchor = a
                         break
-                if second_anchor and expansion_count < self.MAX_AUTO_EXPANSIONS:
+                if second_anchor and expansion_count < self._gate_config.max_auto_expansions:
                     ctx_key = f"contextualize:{second_anchor.get('id', '')}"
                     if ctx_key not in expanded_relations:
                         expansions.append(ExpansionRequest(
@@ -645,8 +657,8 @@ class SufficiencyGate:
                 and _has_completed_negative_search(
                     query_plan,
                     {primary_class_id} if primary_class_id else set(),
-                    self.EXPANSION_MAX_DEPTH,
-                    self.DEFAULT_MIN_CONFIDENCE,
+                    self._gate_config.expansion_max_depth,
+                    self._gate_config.min_confidence,
                 )
             )
             inherits_rels = [
@@ -677,7 +689,7 @@ class SufficiencyGate:
             else:
                 missing.append("继承问题缺少类层次证据")
                 for a in validated_anchor_items:
-                    if a.get("type") == "CLASS" and expansion_count < self.MAX_AUTO_EXPANSIONS:
+                    if a.get("type") == "CLASS" and expansion_count < self._gate_config.max_auto_expansions:
                         ch_key = f"class_hierarchy:{a.get('id', '')}"
                         if ch_key not in expanded_relations:
                             expansions.append(ExpansionRequest(
@@ -691,7 +703,7 @@ class SufficiencyGate:
         # ── 关系要求（继承证据充足时可跳过） ──
         if is_relation and not (is_inheritance and inherits_rels):
             high_conf_rels = _get_high_conf_relations(
-                evidence_items, self.DEFAULT_MIN_CONFIDENCE
+                evidence_items, self._gate_config.min_confidence
             )
             primary_anchors = _get_primary_anchors(
                 question,
@@ -709,8 +721,8 @@ class SufficiencyGate:
                 and _has_completed_negative_search(
                     query_plan,
                     set(primary_ids),
-                    self.EXPANSION_MAX_DEPTH,
-                    self.DEFAULT_MIN_CONFIDENCE,
+                    self._gate_config.expansion_max_depth,
+                    self._gate_config.min_confidence,
                 )
             )
             if len(primary_ids) >= 2:
@@ -753,7 +765,7 @@ class SufficiencyGate:
                         "需要共享调用者或跨实体路径"
                     )
                 # 请求扩展：共享调用者优先，再回退到调用路径或单锚点调用者
-                if primary_anchors and expansion_count < self.MAX_AUTO_EXPANSIONS:
+                if primary_anchors and expansion_count < self._gate_config.max_auto_expansions:
                     func_anchors = [
                         a for a in primary_anchors
                         if a.get("type") in ("FUNCTION", "METHOD")
@@ -767,7 +779,7 @@ class SufficiencyGate:
                                 action="shared_callers",
                                 symbol=src,
                                 target=tgt,
-                                max_depth=self.EXPANSION_MAX_DEPTH,
+                                max_depth=self._gate_config.expansion_max_depth,
                                 reason=(
                                     "关系问题缺少跨实体关系，"
                                     f"查找 {src} 与 {tgt} 的共享调用者"
@@ -781,7 +793,7 @@ class SufficiencyGate:
                                     action="call_paths",
                                     symbol=src,
                                     target=tgt,
-                                    max_depth=self.EXPANSION_MAX_DEPTH,
+                                    max_depth=self._gate_config.expansion_max_depth,
                                     reason=(
                                         "未找到共享调用者，"
                                         f"回退到 {src} → {tgt} 调用路径"
@@ -795,7 +807,7 @@ class SufficiencyGate:
                                 expansions.append(ExpansionRequest(
                                     action="transitive_callers",
                                     symbol=a.get("id", ""),
-                                    max_depth=self.EXPANSION_MAX_DEPTH,
+                                    max_depth=self._gate_config.expansion_max_depth,
                                     reason=f"关系问题缺少跨实体关系证据，扩展 {a.get('id','')} 的传递调用者",
                                     edge_types=["CALLS"],
                                 ))
@@ -836,15 +848,15 @@ class SufficiencyGate:
             if not _has_completed_negative_search(
                 query_plan,
                 primary_anchor_ids,
-                self.EXPANSION_MAX_DEPTH,
-                self.DEFAULT_MIN_CONFIDENCE,
+                self._gate_config.expansion_max_depth,
+                self._gate_config.min_confidence,
             ):
                 scope_parts = []
                 if anchors:
                     scope_parts.append(f"查询目标: {', '.join(a.get('id','') for a in anchors[:2])}")
                 scope_parts.append(f"边类型: CALLS, INHERITS, INSTANTIATED_BY")
-                scope_parts.append(f"搜索深度: ≤{self.EXPANSION_MAX_DEPTH}")
-                scope_parts.append(f"置信度阈值: ≥{self.DEFAULT_MIN_CONFIDENCE}")
+                scope_parts.append(f"搜索深度: ≤{self._gate_config.expansion_max_depth}")
+                scope_parts.append(f"置信度阈值: ≥{self._gate_config.min_confidence}")
                 if expanded_relations:
                     scope_parts.append(
                         f"已尝试: {', '.join(sorted(expanded_relations)[:5])}"

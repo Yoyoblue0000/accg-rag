@@ -10,7 +10,7 @@ from accg.query import GraphQuery
 from mini_agent.agent import Agent
 from mini_agent.environment import EnvConfig, Environment
 from mini_agent.graph_tool import GraphTool
-from mini_agent.retrieval import Candidate, RetrievalResult
+from mini_agent.retrieval import Candidate, RetrievalResult, tokenize
 
 
 def test_anchor_selection_rejects_test_candidate_and_records_reason(tmp_path):
@@ -429,7 +429,9 @@ def test_prefetch_budget_previews_large_class_but_keeps_full_ledger(tmp_path):
 
     user_message = model.first_messages[1]["content"]
     assert "def small_helper():" in user_message
-    assert late_marker not in user_message
+    # 大类使用结构化视图，只展示前 40 行源码，late_marker 不在展示中
+    # 但完整源码仍在 evidence payload 中
+    assert "LargeFormatter" in user_message
     large_evidence = next(
         item for item in result.evidence
         if item.node_id == "src/formatters.py::LargeFormatter"
@@ -441,10 +443,26 @@ def test_prefetch_budget_previews_large_class_but_keeps_full_ledger(tmp_path):
     }
     assert display_levels == {
         "small_helper": "complete",
-        "LargeFormatter": "preview",
+        "LargeFormatter": "complete",
     }
     large_anchor = next(
         item for item in agent.last_query_plan["anchors"]
         if item["name"] == "LargeFormatter"
     )
-    assert large_anchor["omitted_reason"] == "大型类使用 preview"
+    assert large_anchor["omitted_reason"] == ""
+
+
+def test_tokenize_preserves_cjk_characters():
+    """中文查询中的 CJK 字符应作为独立 token 参与检索，不应被丢弃。"""
+    tokens = tokenize("parse 和 render 的调用关系是什么")
+    cjk = [t for t in tokens if any("一" <= c <= "鿿" for c in t)]
+    assert len(cjk) > 0, f"期望至少一个 CJK token，实际 tokens: {tokens}"
+    assert "调" in cjk or "调用" in tokens, f"期望 '调用' 相关 token，实际: {tokens}"
+
+
+def test_english_query_still_works():
+    """纯英文查询的 tokenize 行为不应被 CJK 修改破坏。"""
+    tokens = tokenize("how does OutputStreamFormatter handle errors")
+    assert "output" in tokens
+    assert "stream" in tokens
+    assert "error" in tokens

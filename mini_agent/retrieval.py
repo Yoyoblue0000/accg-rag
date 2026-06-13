@@ -18,17 +18,42 @@ _STAGE_ORDER = {
     "fuzzy": 4,
 }
 
-_FIELD_BOOSTS = {
-    "id": 3.0,
-    "name": 4.0,
-    "qualified_name": 3.0,
-    "type": 1.2,
-    "file": 1.4,
-    "signature": 2.0,
-    "docstring": 1.0,
-    "decorator": 2.5,
-    "summary": 5.0,       # 离线 7B 摘要，高质量语义信号
-}
+@dataclass
+class RetrievalConfig:
+    """候选检索的可配置参数。各阶段分数为叠加值，层级差距确保排序稳定。"""
+
+    # 阶段基础分
+    exact_id_score: float = 1000.0
+    exact_symbol_score: float = 900.0
+    lexical_base: float = 100.0
+    embedding_base: float = 80.0
+    embedding_scale: float = 80.0
+    fuzzy_base: float = 10.0
+    fuzzy_scale: float = 20.0
+
+    # 类别降权系数
+    test_category_multiplier: float = 0.55
+    docs_category_multiplier: float = 0.7
+
+    # 模糊匹配最低阈值
+    fuzzy_min_similarity: float = 0.18
+
+    # BM25 字段权重
+    field_boosts: dict[str, float] = field(default_factory=lambda: {
+        "id": 3.0,
+        "name": 4.0,
+        "qualified_name": 3.0,
+        "type": 1.2,
+        "file": 1.4,
+        "signature": 2.0,
+        "docstring": 1.0,
+        "decorator": 2.5,
+        "summary": 5.0,
+    })
+
+
+# 保留模块级默认实例，供外部模块直接引用（向后兼容）
+DEFAULT_RETRIEVAL_CONFIG = RetrievalConfig()
 
 _STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "between", "by", "does",
@@ -106,15 +131,27 @@ def _stem_token(token: str) -> str:
     return token
 
 
+# CJK 统一汉字范围（CJK Unified Ideographs）
+_CJK_RE = re.compile(r"[一-鿿㐀-䶿]+")
+
+
+def _is_cjk(char: str) -> bool:
+    return "一" <= char <= "鿿" or "㐀" <= char <= "䶿"
+
+
 def tokenize(text: str) -> list[str]:
-    """拆分路径、snake_case 与 CamelCase，并做轻量词形归一化。"""
+    """拆分路径、snake_case、CamelCase 与 CJK 字符，并做轻量词形归一化。"""
     text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", str(text))
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
-    raw_tokens = re.findall(r"[A-Za-z0-9]+", text.lower())
+    lowered = text.lower()
+    raw_tokens = re.findall(r"[A-Za-z0-9]+", lowered)
+    # CJK 字符按单字拆分，确保中文查询词参与检索
+    for cjk_run in _CJK_RE.findall(text):
+        raw_tokens.extend(list(cjk_run))
     return [
         _stem_token(token)
         for token in raw_tokens
-        if token not in _STOP_WORDS and len(token) > 1
+        if token not in _STOP_WORDS and (len(token) > 1 or _is_cjk(token))
     ]
 
 
@@ -143,10 +180,19 @@ def _query_targets_category(query: str, category: str) -> bool:
     return True
 
 
-def _category_multiplier(entry: _Entry, query: str) -> float:
+def _category_multiplier(
+    entry: _Entry,
+    query: str,
+    config: RetrievalConfig | None = None,
+) -> float:
+    cfg = config or DEFAULT_RETRIEVAL_CONFIG
     if entry.category == "source" or _query_targets_category(query, entry.category):
         return 1.0
-    return 0.55 if entry.category == "test" else 0.7
+    return (
+        cfg.test_category_multiplier
+        if entry.category == "test"
+        else cfg.docs_category_multiplier
+    )
 
 
 def build_entries(graph, summaries: dict[str, str] | None = None) -> list[_Entry]:
@@ -217,7 +263,12 @@ def build_entries(graph, summaries: dict[str, str] | None = None) -> list[_Entry
 class CandidateRetriever:
     """在图符号元数据上执行可观察、可降级的检索级联。"""
 
-    def __init__(self, entries: list[_Entry]):
+    def __init__(
+        self,
+        entries: list[_Entry],
+        config: RetrievalConfig | None = None,
+    ):
+        self._config = config or DEFAULT_RETRIEVAL_CONFIG
         self.entries = entries
         self._by_id = {entry.id: entry for entry in entries}
         self._by_id_folded = {
@@ -249,7 +300,7 @@ class CandidateRetriever:
             weighted = Counter()
             seen = set()
             for field_name, tokens in entry.fields.items():
-                boost = _FIELD_BOOSTS[field_name]
+                boost = self._config.field_boosts[field_name]
                 for token in tokens:
                     weighted[token] += boost
                     seen.add(token)
@@ -276,11 +327,12 @@ class CandidateRetriever:
 
         exact_id, exact_symbol = self._exact_matches(query)
         attempted.extend(["exact_id", "exact_symbol"])
+        cfg = self._config
         if exact_id:
             succeeded.append("exact_id")
             for entry in exact_id:
                 self._merge(
-                    merged, entry, 1000.0, "exact_id",
+                    merged, entry, cfg.exact_id_score, "exact_id",
                     matched_terms=[entry.id],
                     matched_fields=["id"],
                 )
@@ -290,7 +342,7 @@ class CandidateRetriever:
                 self._merge(
                     merged,
                     entry,
-                    900.0 * _category_multiplier(entry, query),
+                    cfg.exact_symbol_score * _category_multiplier(entry, query, cfg),
                     "exact_symbol",
                     matched_terms=tokenize(entry.name),
                     matched_fields=["name"],
@@ -304,7 +356,7 @@ class CandidateRetriever:
                 self._merge(
                     merged,
                     entry,
-                    100.0 + score,
+                    cfg.lexical_base + score,
                     "lexical",
                     terms,
                     fields,
@@ -324,7 +376,7 @@ class CandidateRetriever:
                     self._merge(
                         merged,
                         entry,
-                        80.0 + score * 80.0,
+                        cfg.embedding_base + score * cfg.embedding_scale,
                         "embedding",
                         [],
                         [],
@@ -341,7 +393,7 @@ class CandidateRetriever:
                     self._merge(
                         merged,
                         entry,
-                        10.0 + score * 20.0,
+                        cfg.fuzzy_base + score * cfg.fuzzy_scale,
                         "fuzzy",
                         terms,
                         fields,
@@ -449,7 +501,7 @@ class CandidateRetriever:
                 score += idf * frequency * 2.5 / denominator
 
             if score:
-                score *= _category_multiplier(entry, query)
+                score *= _category_multiplier(entry, query, self._config)
                 ranked.append((
                     entry,
                     round(score, 6),
@@ -487,8 +539,8 @@ class CandidateRetriever:
                     best_score = score
                     best_field = field_name
                     matched_terms = overlap
-            if best_score >= 0.18:
-                best_score *= _category_multiplier(entry, query)
+            if best_score >= self._config.fuzzy_min_similarity:
+                best_score *= _category_multiplier(entry, query, self._config)
                 ranked.append((
                     entry,
                     round(best_score, 6),
@@ -637,22 +689,25 @@ def select_query_anchors(
         if len(selected) >= max_anchors:
             return selected
 
-    type_order = preferred_types or ["FUNCTION", "CLASS", "METHOD"]
-    for wanted_type in type_order:
-        match = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.type == wanted_type
-                and candidate.id not in selected_ids
-            ),
-            None,
+    # 剩余候补：分数驱动，类型仅做平局打破
+    type_rank = (
+        {t: i for i, t in enumerate(preferred_types)}
+        if preferred_types
+        else {}
+    )
+    remaining = [
+        candidate
+        for candidate in candidates
+        if candidate.id not in selected_ids
+    ]
+    remaining.sort(
+        key=lambda c: (
+            -c.score,
+            type_rank.get(c.type, len(type_rank)),
+            candidates.index(c),
         )
-        if match is not None:
-            if _add(match):
-                return selected
-
-    for candidate in candidates:
+    )
+    for candidate in remaining:
         if _add(candidate):
             break
     return selected
