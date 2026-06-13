@@ -595,6 +595,10 @@ def select_query_anchors(
             if match is not None and _add(match):
                 return selected
 
+    if not required and candidates and not selected:
+        if _add(candidates[0]):
+            return selected
+
     for candidate in candidates:
         if (
             "exact_symbol" in candidate.sources

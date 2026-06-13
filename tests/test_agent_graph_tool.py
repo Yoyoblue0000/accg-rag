@@ -806,6 +806,43 @@ def test_call_paths_expansion_contextualizes_path_nodes(tmp_path):
     )
 
 
+def test_shared_callers_zero_result_has_no_source_evidence(tmp_path):
+    from mini_agent.query_plan import QueryPlan
+    from mini_agent.sufficiency import ExpansionRequest
+
+    graph = nx.MultiDiGraph()
+    for name in ("first", "second"):
+        _add_symbol(
+            graph,
+            f"src/{name}.py::{name}",
+            NodeType.FUNCTION,
+            name,
+            f"src/{name}.py",
+        )
+    agent = Agent(
+        _FinalModel(),
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=_graph_tool(graph, tmp_path),
+    )
+    query_plan = QueryPlan(query="How are first and second related?")
+
+    agent._execute_expansions(
+        [ExpansionRequest(
+            action="shared_callers",
+            symbol="src/first.py::first",
+            target="src/second.py::second",
+            edge_types=["CALLS"],
+        )],
+        query_plan,
+    )
+
+    expansion = query_plan.relation_expansions[0]
+    assert expansion["status"] == "completed"
+    assert expansion["result_count"] == 0
+    assert expansion["expanded_node_ids"] == []
+    assert expansion["source_evidence_ids"] == []
+
+
 def test_relation_gate_expands_shared_caller_before_accepting_final(tmp_path):
     source_dir = tmp_path / "src"
     source_dir.mkdir()

@@ -572,6 +572,95 @@ class TestSufficiencyGateBasic:
 
         assert decision.passed
 
+    def test_relative_qualified_entity_is_locatable_in_same_source(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释精确字符串匹配器如何定位子串",
+            evidence_items=[
+                _src("src/entry.py::explain_matcher"),
+                _FakeItem(
+                    "source",
+                    file="src/matchers.py",
+                    start_line=1,
+                    end_line=8,
+                    payload={
+                        "name": "src/matchers.py",
+                        "type": "FILE",
+                        "file": "src/matchers.py",
+                        "start_line": 1,
+                        "end_line": 8,
+                        "source_context": (
+                            "class ExactStringMatcher:\n"
+                            "    def _find_substring_location(self, raw):\n"
+                            "        return raw.find(self.template)\n"
+                        ),
+                    },
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor("src/entry.py::explain_matcher"),
+                ],
+            },
+            draft=(
+                "`ExactStringMatcher::_find_substring_location` "
+                "uses the underlying string search."
+            ),
+        )
+
+        assert decision.passed
+
+    def test_relative_qualified_entity_cannot_span_separate_sources(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释精确字符串匹配器如何定位子串",
+            evidence_items=[
+                _src("src/entry.py::explain_matcher"),
+                _FakeItem(
+                    "source",
+                    file="src/class_only.py",
+                    start_line=1,
+                    end_line=2,
+                    payload={
+                        "name": "src/class_only.py",
+                        "type": "FILE",
+                        "file": "src/class_only.py",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "source_context": "class ExactStringMatcher:\n    pass\n",
+                    },
+                ),
+                _FakeItem(
+                    "source",
+                    file="src/method_only.py",
+                    start_line=1,
+                    end_line=2,
+                    payload={
+                        "name": "src/method_only.py",
+                        "type": "FILE",
+                        "file": "src/method_only.py",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "source_context": (
+                            "def _find_substring_location(raw):\n"
+                            "    return raw.find('x')\n"
+                        ),
+                    },
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor("src/entry.py::explain_matcher"),
+                ],
+            },
+            draft=(
+                "`ExactStringMatcher::_find_substring_location` "
+                "performs the search."
+            ),
+        )
+
+        assert not decision.passed
+
     def test_draft_literals_expressions_and_sql_phrases_are_not_entities(self):
         gate = SufficiencyGate()
         decision = gate.evaluate(
@@ -589,6 +678,53 @@ class TestSufficiencyGateBasic:
                 "`None`; the separate grammar phrase "
                 "`WHEN NOT MATCHED BY SOURCE` is syntax, not a code entity."
             ),
+        )
+
+        assert decision.passed
+
+    def test_protocol_tool_names_are_not_draft_entities(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释 MergeMatchSegment",
+            evidence_items=[
+                _src("src/dialect.py::MergeMatchSegment"),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor(
+                        "src/dialect.py::MergeMatchSegment",
+                        atype="CLASS",
+                    ),
+                ],
+            },
+            draft=(
+                "The class was inspected with `contextualize` and "
+                "`read_file`."
+            ),
+        )
+
+        assert decision.passed
+
+    def test_evidence_file_basename_is_locatable(self):
+        gate = SufficiencyGate()
+        decision = gate.evaluate(
+            question="解释 BigQuery MERGE 语法来源",
+            evidence_items=[
+                _src(
+                    "src/sqlfluff/dialects/dialect_ansi.py::"
+                    "MergeMatchSegment"
+                ),
+            ],
+            query_plan={
+                "anchors": [
+                    _anchor(
+                        "src/sqlfluff/dialects/dialect_ansi.py::"
+                        "MergeMatchSegment",
+                        atype="CLASS",
+                    ),
+                ],
+            },
+            draft="The inherited grammar is defined in `dialect_ansi.py`.",
         )
 
         assert decision.passed

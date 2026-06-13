@@ -129,6 +129,38 @@ def test_explicit_method_request_prioritizes_method_anchor(tmp_path):
     assert "METHOD" in anchors[0]["selection_reason"]
 
 
+def test_single_anchor_preserves_top_rank_without_explicit_type(tmp_path):
+    tool = GraphTool(str(tmp_path))
+    candidates = [
+        {
+            "id": "src/rule.py::Rule::_get_indentation",
+            "name": "_get_indentation",
+            "type": "METHOD",
+            "file": "src/rule.py",
+            "score": 274.0,
+            "sources": ["lexical", "embedding"],
+            "matched_terms": ["indent", "indentation", "unit"],
+        },
+        {
+            "id": "src/respace.py::_construct_alignment_whitespace",
+            "name": "_construct_alignment_whitespace",
+            "type": "FUNCTION",
+            "file": "src/respace.py",
+            "score": 268.0,
+            "sources": ["lexical", "embedding"],
+            "matched_terms": ["indent", "unit", "whitespace"],
+        },
+    ]
+
+    anchors = tool.select_query_anchors(
+        "What is the propagation path through indentation checking?",
+        candidates,
+        max_anchors=2,
+    )
+
+    assert anchors[0]["id"] == "src/rule.py::Rule::_get_indentation"
+
+
 def test_comparison_prioritizes_distinct_entity_terms_over_unrelated_type(
     tmp_path,
 ):

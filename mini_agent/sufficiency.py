@@ -89,6 +89,20 @@ _CODE_LITERALS = {
     "none", "true", "false", "null", "nil",
     "self", "cls",
 }
+_PROTOCOL_TOOL_NAMES = {
+    "query_graph",
+    "contextualize",
+    "narrow_down",
+    "extract_clues",
+    "transitive_callers",
+    "transitive_callees",
+    "call_paths",
+    "class_hierarchy",
+    "module_tree",
+    "module_structure",
+    "read_file",
+    "list_dir",
+}
 _NEGATIVE_RELATION_PATTERNS = (
     re.compile(
         r"\bno\s+(?:(?:direct|indirect|bounded)\s+)?"
@@ -276,17 +290,29 @@ def _unresolved_draft_entities(
                     if part
                 )
         payload = getattr(item, "payload", {})
+        file_path = getattr(item, "file", "") or ""
         if isinstance(payload, dict):
             if payload.get("name"):
                 known.add(str(payload["name"]).lower())
+            file_path = file_path or str(payload.get("file", ""))
             source_context = payload.get("source_context")
             if source_context:
                 source_contexts.append(str(source_context).lower())
+        elif isinstance(payload, str):
+            source_contexts.append(payload.lower())
+        if file_path:
+            normalized_file = file_path.replace("\\", "/").lower()
+            known.add(normalized_file)
+            known.add(normalized_file.rsplit("/", 1)[-1])
 
     def is_entity_reference(value: str) -> bool:
         stripped = value.strip()
         lowered = stripped.lower()
-        if not stripped or lowered in _CODE_LITERALS:
+        if (
+            not stripped
+            or lowered in _CODE_LITERALS
+            or lowered in _PROTOCOL_TOOL_NAMES
+        ):
             return False
         if "::" in stripped:
             return True
@@ -298,6 +324,22 @@ def _unresolved_draft_entities(
 
     def appears_in_source(value: str) -> bool:
         lowered = value.lower()
+        if "::" in value:
+            parts = [
+                part.lower()
+                for part in value.split("::")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part)
+            ]
+            if not parts:
+                return False
+            patterns = [
+                re.compile(rf"\b{re.escape(part)}\b")
+                for part in parts
+            ]
+            return any(
+                all(pattern.search(context) for pattern in patterns)
+                for context in source_contexts
+            )
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
             pattern = re.compile(rf"\b{re.escape(lowered)}\b")
             return any(pattern.search(context) for context in source_contexts)
