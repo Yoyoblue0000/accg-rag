@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""QA 评估脚本 — 使用图增强 Agent 回答 sweqa_requests 问题"""
+"""QA 评估脚本 — 使用图增强 Agent 回答 sweqa_requests 问题，含发布门禁。"""
 
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from mini_agent.model import Model, ModelConfig
 from mini_agent.environment import Environment, EnvConfig
 from mini_agent.agent import Agent, RunResult, MsgRecord
 from mini_agent.graph_tool import GraphTool
+from mini_agent.multi_entity import EntityExtractor
 from mini_agent.reranker import Reranker
 from mini_agent.retrieval_metrics import (
     aggregate_retrieval_metrics,
@@ -32,16 +34,71 @@ def _fmt_candidates(anchors: list[dict]) -> str:
     return " · ".join(parts)
 
 
-def _status_mark(result: RunResult) -> str:
-    """✓ 正常 / ⚠ 零探索 / ✗ 出错"""
+def _status_mark(result: RunResult, *, retrieval_only: bool = False) -> str:
+    """✓ 正常 / ⚠ 零探索 / ✗ 出错或未完成"""
+    if retrieval_only:
+        if result.retrieval is None or result.retrieval.status == "failed":
+            return "✗"
+        return "✓"
     if result.error:
+        return "✗"
+    if not result.answer or result.answer.startswith("[达到最大步数]"):
         return "✗"
     if result.rounds > 0 and result.explorations == 0:
         return "⚠"
     return "✓"
 
 
-def _print_silent(run_index: int, total: int, qa: dict, result: RunResult):
+_JUDGE_PROMPT = """\
+评估以下 Agent 答案与参考答案的一致性。仅输出一个 JSON 对象，无其他文字。
+
+## 问题
+{question}
+
+## 参考答案
+{expected}
+
+## Agent 答案
+{actual}
+
+## 输出格式
+{{"score": 0.0-1.0, "label": "正确|部分正确|无关|错误", "reason": "一句话理由"}}
+
+评分标准:
+- 1.0: 核心结论与参考答案一致，关键事实正确
+- 0.7-0.9: 大部分正确，但缺少细节或有小错误
+- 0.4-0.6: 部分正确，但缺少关键信息或有主要错误
+- 0.1-0.3: 基本不相关或大部分错误
+- 0.0: 完全错误或无关"""
+
+
+def _evaluate_answer_quality(judge_model, question: str, expected: str, actual: str) -> dict:
+    """用独立 LLM judge 评估答案质量，校验 score 范围。"""
+    if not judge_model or not expected or not actual:
+        return {"score": None, "label": "未评估", "reason": "缺少评估模型、参考答案或 Agent 答案"}
+    if actual.startswith("[达到最大步数]") or actual.startswith("[错误]"):
+        return {"score": 0.0, "label": "错误", "reason": "Agent 未完成运行"}
+    prompt = _JUDGE_PROMPT.format(question=question, expected=expected, actual=actual)
+    try:
+        raw = judge_model.generate([{"role": "user", "content": prompt}])
+        json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+            score = result.get("score", -1)
+            if not isinstance(score, (int, float)) or not (0 <= score <= 1):
+                return {"score": None, "label": "解析失败", "reason": f"score 超出 [0,1]: {score}"}
+            return {
+                "score": float(score),
+                "label": str(result.get("label", "未知")),
+                "reason": str(result.get("reason", "")),
+            }
+    except Exception:
+        pass
+    return {"score": None, "label": "解析失败", "reason": "LLM judge 输出无法解析"}
+
+
+def _print_silent(run_index: int, total: int, qa: dict, result: RunResult,
+                  *, retrieval_only: bool = False):
     """静默层：每题一行"""
     q = qa["question"][:80]
     selected_anchors = (
@@ -51,14 +108,15 @@ def _print_silent(run_index: int, total: int, qa: dict, result: RunResult):
     )
     anchors = _fmt_candidates(selected_anchors)
     ans_len = len(result.answer) if result.answer else 0
-    mark = _status_mark(result)
+    mark = _status_mark(result, retrieval_only=retrieval_only)
     print(f"[{run_index+1:>2}/{total}] {mark} "
           f"{result.rounds}轮{result.explorations}探 | "
           f"锚:{anchors} | "
           f"{ans_len}字")
 
 
-def _print_summary(results: list[tuple[int, dict, RunResult]]):
+def _print_summary(results: list[tuple[int, dict, RunResult]], *,
+                   retrieval_only: bool = False):
     """跑完后汇总表"""
     total = len(results)
     total_rounds = sum(r.rounds for _, _, r in results)
@@ -72,7 +130,7 @@ def _print_summary(results: list[tuple[int, dict, RunResult]]):
     print(f"{'#':>3} {'状态':<3} {'轮':>3} {'探':>3} {'字数':>5}  {'首锚点'}")
     print(f"{'─'*60}")
     for idx, qa, r in results:
-        mark = _status_mark(r)
+        mark = _status_mark(r, retrieval_only=retrieval_only)
         top1 = "—"
         selected_anchors = (
             r.query_plan.get("anchors", [])
@@ -92,23 +150,19 @@ def _print_summary(results: list[tuple[int, dict, RunResult]]):
 
 def _print_verbose_step(m: MsgRecord) -> None:
     """-v：单条消息即时输出"""
-
     if m.role == "system":
         return
-
     elif m.role == "user":
         content = m.content.replace("[候选符号] 以下与问题语义最相关:", "\n  [候选锚点]")
         print(f"\n{'─'*60}")
         print(f"[Init] 用户问题 + 候选锚点")
         print(f"{'─'*60}")
         print(content)
-
     elif m.role == "assistant":
         print(f"\n{'─'*60}")
         print(f"[Step {m.step}] LLM 返回")
         print(f"{'─'*60}")
         print(m.content)
-
     elif m.role == "tool":
         tag = " (拦截)" if m.intercepted else ""
         print(f"\n[Step {m.step}] {m.tool_name}{tag} {json.dumps(m.tool_args or {}, ensure_ascii=False)}")
@@ -117,22 +171,18 @@ def _print_verbose_step(m: MsgRecord) -> None:
 
 def _print_verbose2_step(m: MsgRecord) -> None:
     """-vv：单条消息 + 原始 JSON"""
-
     if m.role == "system":
         return
-
     elif m.role == "user":
         print(f"\n{'─'*60}")
         print(f"[Init] user")
         print(f"{'─'*60}")
         print(m.content)
-
     elif m.role == "assistant":
         print(f"\n{'─'*60}")
         print(f"[Step {m.step}] LLM 原话")
         print(f"{'─'*60}")
         print(m.content)
-
     elif m.role == "tool":
         tag = " (拦截)" if m.intercepted else ""
         print(f"\n{'─'*60}")
@@ -159,11 +209,17 @@ def _print_synthesis(result: RunResult, verbosity: int) -> None:
     print(result.synthesis.answer)
 
 
+def _is_judge_passed(judge_result: dict, threshold: float) -> bool:
+    """Judge 评估通过：无解析失败且分数 >= 阈值。"""
+    score = judge_result.get("score")
+    return isinstance(score, (int, float)) and score >= threshold
+
+
 def main():
     _qa_default = os.environ.get("QA_PATH") or os.path.expanduser("~/program/sqlfluff_qa.json")
     _proj_default = os.environ.get("PROJECT_PATH") or os.path.expanduser("~/program/sqlfluff_repo")
 
-    parser = argparse.ArgumentParser(description="QA 评估脚本")
+    parser = argparse.ArgumentParser(description="QA 评估脚本，含发布门禁")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v 摘要 / -vv 详细（含原始 JSON）")
     parser.add_argument("--limit", type=int, default=3, help="只跑前 N 条问题")
@@ -172,13 +228,11 @@ def main():
     parser.add_argument("--project-path", default=_proj_default, help="待分析项目路径")
     parser.add_argument(
         "--model",
-        default=os.environ.get(
-            "OLLAMA_MODEL",
-            "qwen2.5-coder:14b-instruct",
-        ),
+        default=os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:14b-instruct"),
         help="模型名",
     )
-    parser.add_argument("--base-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"), help="Ollama API 地址")
+    parser.add_argument("--base-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434/v1"),
+                        help="Ollama API 地址")
     parser.add_argument("--output", default="/tmp/qa_results.json", help="结果输出路径")
     parser.add_argument(
         "--retrieval-only",
@@ -205,6 +259,29 @@ def main():
         "--embedding-model",
         default=os.environ.get("EMBEDDING_MODEL", "mxbai-embed-large"),
         help="embedding 模型名（默认 mxbai-embed-large）",
+    )
+    # ── 门禁参数 ──
+    parser.add_argument(
+        "--judge-model",
+        default=os.environ.get("JUDGE_MODEL", ""),
+        help="LLM-as-judge 专用模型（与回答模型分离）。留空则不启用 judge",
+    )
+    parser.add_argument(
+        "--judge-threshold",
+        type=float,
+        default=float(os.environ.get("JUDGE_THRESHOLD", "0.7")),
+        help="Judge 通过的最低分数阈值，默认 0.7",
+    )
+    parser.add_argument(
+        "--fail-on-error",
+        action="store_true",
+        default=os.environ.get("QA_FAIL_ON_ERROR", "") in {"1", "true", "yes"},
+        help="任何错误/空答案/judge 失败均触发非零退出码",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="从已有输出文件恢复，跳过已完成的题目",
     )
     args = parser.parse_args()
 
@@ -235,10 +312,20 @@ def main():
         ))
         reranker = Reranker(reranker_model, project_root=args.project_path)
 
+    # 独立 Judge 模型
+    judge_model = None
+    if args.judge_model:
+        judge_model = Model(ModelConfig(
+            base_url=args.base_url,
+            api_key="ollama",
+            model_name=args.judge_model,
+            quiet=True,
+        ))
+
     qa_path = Path(args.qa_path)
     if not qa_path.is_file():
-        print("QA_PATH 未设置或文件不存在", file=sys.stderr)
-        return
+        print(f"QA 文件不存在: {qa_path}", file=sys.stderr)
+        sys.exit(2)
     questions = json.loads(qa_path.read_text(encoding="utf-8"))
 
     if args.id:
@@ -251,17 +338,41 @@ def main():
         selected_questions = list(enumerate(questions[: args.limit]))
 
     out_path = Path(args.output)
-    out_path.write_text("[]", encoding="utf-8")
     summary_path = out_path.with_name(f"{out_path.stem}.summary.json")
 
-    results_for_summary: list[tuple[int, dict, RunResult]] = []
+    # ── 恢复模式 ──
     artifact_records: list[dict] = []
+    completed_indices: set[int] = set()
+    if args.resume and out_path.is_file():
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+            for record in existing:
+                if isinstance(record, dict):
+                    artifact_records.append(record)
+                    completed_indices.add(record.get("index", -1))
+        except json.JSONDecodeError:
+            pass
+    else:
+        out_path.write_text("[]", encoding="utf-8")
+
+    results_for_summary: list[tuple[int, dict, RunResult]] = []
 
     if args.retrieval_only:
         print(graph_tool.ensure_built(), flush=True)
 
+    # ── 门禁统计 ──
+    exit_code = 0
+    completed_count = 0
+    failed_count = 0
+
     for run_index, (source_index, qa) in enumerate(selected_questions):
         question = qa["question"]
+
+        # 跳过已完成的题目
+        if args.resume and source_index in completed_indices:
+            if verbosity >= 1:
+                print(f"\n[QA {run_index+1}/{len(selected_questions)}] 跳过已完成 #{source_index}: {question[:60]}...")
+            continue
 
         # 构建回调：非静默模式下每步即时输出
         def _on_step(record: MsgRecord) -> None:
@@ -277,52 +388,66 @@ def main():
             print(f"[QA {run_index+1}/{len(selected_questions)}] {question[:100]}...")
             print(f"{'='*60}")
 
-        if args.retrieval_only:
-            retrieval = graph_tool.retrieve_query_candidates(
-                question,
-                limit=10,
-                use_embeddings=args.embedding and not args.no_embedding,
-            )
-            candidate_dicts = [
-                candidate.to_dict()
-                for candidate in retrieval.candidates
-            ]
-            anchors = graph_tool.select_query_anchors(
-                question,
-                candidate_dicts,
-                max_anchors=3,
-            )
-            result = RunResult(
-                answer="",
-                anchor_candidates=candidate_dicts,
-                retrieval=retrieval,
-                query_plan={
-                    "query": question,
-                    "candidates": candidate_dicts,
-                    "anchors": anchors,
-                    "rejected_anchors": [],
-                    "prefetch_evidence_ids": [],
-                    "relation_expansions": [],
-                    "diagnostics": list(retrieval.diagnostics),
-                },
-            )
-        else:
-            agent = Agent(
-                model,
-                env,
-                graph_tool=graph_tool,
-                max_steps=12,
-                on_step=_on_step,
-                on_audit=print if verbosity >= 2 else None,
-                reranker=reranker,
-            )
-            result = agent.run(question)
+        # ── 单题 try/except 保护 ──
+        try:
+            result = RunResult(answer="", error="未执行")
+            if args.retrieval_only:
+                retrieval = graph_tool.retrieve_query_candidates(
+                    question,
+                    limit=10,
+                    use_embeddings=args.embedding and not args.no_embedding,
+                )
+                candidate_dicts = [
+                    candidate.to_dict()
+                    for candidate in retrieval.candidates
+                ]
+                anchors = graph_tool.select_query_anchors(
+                    question,
+                    candidate_dicts,
+                    max_anchors=3,
+                )
+                result = RunResult(
+                    answer="",
+                    anchor_candidates=candidate_dicts,
+                    retrieval=retrieval,
+                    query_plan={
+                        "query": question,
+                        "candidates": candidate_dicts,
+                        "anchors": anchors,
+                        "rejected_anchors": [],
+                        "prefetch_evidence_ids": [],
+                        "relation_expansions": [],
+                        "diagnostics": list(retrieval.diagnostics),
+                    },
+                )
+            else:
+                entity_extractor = EntityExtractor(model)
+                agent = Agent(
+                    model,
+                    env,
+                    graph_tool=graph_tool,
+                    max_steps=12,
+                    on_step=_on_step,
+                    on_audit=print if verbosity >= 2 else None,
+                    reranker=reranker,
+                    entity_extractor=entity_extractor,
+                )
+                result = agent.run(question)
+        except Exception as exc:
+            result = RunResult(answer="", error=f"未捕获异常: {exc}")
+            failed_count += 1
+            if verbosity >= 1:
+                print(f"[错误] QA 题目 {source_index} 异常: {exc}")
 
         if verbosity >= 1:
             _print_synthesis(result, verbosity)
 
         expected_answer = qa.get("answer", "")
         gold = extract_provisional_gold(expected_answer)
+
+        # LLM Judge 答案质量评估（独立模型）
+        judge_result = _evaluate_answer_quality(judge_model, question, expected_answer, result.answer)
+
         retrieval_payload = (
             result.retrieval.to_dict()
             if result.retrieval is not None
@@ -368,9 +493,7 @@ def main():
             "retrieval_metrics": retrieval_metrics,
             "query_plan": query_plan_payload,
             "anchor_metrics": anchor_metrics,
-            "prefetch_evidence_ids": query_plan_payload[
-                "prefetch_evidence_ids"
-            ],
+            "prefetch_evidence_ids": query_plan_payload["prefetch_evidence_ids"],
             "first_request_display_levels": [
                 {
                     "id": anchor.get("id", ""),
@@ -380,7 +503,9 @@ def main():
                 for anchor in query_plan_payload["anchors"]
             ],
             "rerank": query_plan_payload.get("rerank"),
+            "answer_judge": judge_result,
         })
+        completed_indices.add(source_index)
         out_path.write_text(
             json.dumps(artifact_records, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -389,20 +514,56 @@ def main():
         results_for_summary.append((source_index, qa, result))
 
         if verbosity == 0:
-            _print_silent(run_index, len(selected_questions), qa, result)
+            _print_silent(run_index, len(selected_questions), qa, result,
+                          retrieval_only=args.retrieval_only)
 
+        # ── 单题失败计数 ──
+        is_failed = (
+            bool(result.error)
+            or (not args.retrieval_only and (not result.answer or result.answer.startswith("[达到最大步数]")))
+            or (args.retrieval_only and (result.retrieval is None or result.retrieval.status == "failed"))
+        )
+        if is_failed:
+            failed_count += 1
+        else:
+            completed_count += 1
+
+    # ── 门禁汇总 ──
+    total_run = completed_count + failed_count
+    judge_scores = []
+    judge_evaluable = 0
+    judge_passed = 0
+    for record in artifact_records:
+        jr = record.get("answer_judge", {})
+        score = jr.get("score")
+        if isinstance(score, (int, float)):
+            judge_scores.append(score)
+            judge_evaluable += 1
+            if score >= args.judge_threshold:
+                judge_passed += 1
+
+    judge_mean = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
+    judge_pass_rate = judge_passed / judge_evaluable if judge_evaluable > 0 else 0.0
+
+    # ── 保存汇总 ──
+    retrieval_summary = aggregate_retrieval_metrics(artifact_records)
+    summary_data = {
+        "completed": completed_count,
+        "failed": failed_count,
+        "total": total_run,
+        "judge_evaluable": judge_evaluable,
+        "judge_mean": round(judge_mean, 3),
+        "judge_pass_rate": round(judge_pass_rate, 3),
+        "judge_threshold": args.judge_threshold,
+        "retrieval": retrieval_summary,
+    }
     summary_path.write_text(
-        json.dumps(
-            aggregate_retrieval_metrics(artifact_records),
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps(summary_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
     if verbosity == 0:
-        _print_summary(results_for_summary)
-        retrieval_summary = aggregate_retrieval_metrics(artifact_records)
+        _print_summary(results_for_summary, retrieval_only=args.retrieval_only)
         print(
             "检索指标: "
             f"R@1={retrieval_summary['recall_at_1']:.3f} "
@@ -419,8 +580,44 @@ def main():
             f"type_cov={retrieval_summary['type_coverage']:.3f}"
         )
 
+    # ── 门禁判定 ──
+    print(f"\n{'='*60}")
+    print(f"发布门禁")
+    print(f"{'='*60}")
+    print(f"完成: {completed_count} 题  失败: {failed_count} 题  (共 {total_run} 题)")
+    if judge_evaluable > 0:
+        print(f"Judge 可评估: {judge_evaluable} 题  "
+              f"平均分: {judge_mean:.3f}  "
+              f"通过率 (≥{args.judge_threshold}): {judge_pass_rate:.1%}")
+
+    gate_reasons = []
+    if args.fail_on_error:
+        if failed_count > 0:
+            gate_reasons.append(f"{failed_count} 题失败")
+        if not args.retrieval_only and judge_model and judge_evaluable > 0:
+            if judge_passed < judge_evaluable:
+                gate_reasons.append(
+                    f"Judge 通过率 {judge_pass_rate:.1%} < 100% "
+                    f"({judge_evaluable - judge_passed} 题低于阈值 {args.judge_threshold})"
+                )
+            # judge 解析失败也算阻断
+            parse_failures = sum(
+                1 for record in artifact_records
+                if record.get("answer_judge", {}).get("label") == "解析失败"
+            )
+            if parse_failures > 0:
+                gate_reasons.append(f"{parse_failures} 题 Judge 解析失败")
+
+    if gate_reasons:
+        print(f"\n[门禁未通过] {'; '.join(gate_reasons)}")
+        exit_code = 1
+    else:
+        print("\n[门禁通过]")
+
     print(f"\n结果已保存到 {out_path}")
-    print(f"检索汇总已保存到 {summary_path}")
+    print(f"汇总已保存到 {summary_path}")
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
