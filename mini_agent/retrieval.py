@@ -23,7 +23,7 @@ class RetrievalConfig:
 
     # 阶段基础分
     exact_id_score: float = 1000.0
-    exact_symbol_score: float = 900.0
+    exact_symbol_score: float = 300.0
     lexical_base: float = 100.0
     embedding_base: float = 80.0
     embedding_scale: float = 80.0
@@ -41,8 +41,8 @@ class RetrievalConfig:
     # 同名符号数超过此值时，分数 = base / log2(hit_count)
     exact_symbol_hit_count_threshold: int = 3
 
-    # 词法阶段缩放倍数（让 lexical 能够与降权后的 exact_symbol 竞争）
-    lexical_scale: float = 2.5
+    # 词法阶段缩放倍数
+    lexical_scale: float = 1.0
 
     # BM25 字段权重
     field_boosts: dict[str, float] = field(default_factory=lambda: {
