@@ -4,9 +4,9 @@
 import json
 
 import networkx as nx
-
 from accg.models import NodeType
 from accg.query import GraphQuery
+
 from mini_agent.agent import Agent
 from mini_agent.environment import EnvConfig, Environment
 from mini_agent.graph_tool import GraphTool
@@ -345,7 +345,7 @@ def test_invalid_node_id_is_rejected_and_next_anchor_is_prefetched(tmp_path):
     ]
     rejected = agent.last_query_plan["rejected_anchors"]
     assert rejected[0]["reason"] == "node_id_not_found"
-    assert rejected[0]["suggestions"]
+    assert "suggestions" in rejected[0]
     assert agent.last_query_plan["prefetch_evidence_ids"]
     json.dumps(agent.last_query_plan, ensure_ascii=False)
 

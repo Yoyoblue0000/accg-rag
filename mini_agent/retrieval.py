@@ -9,7 +9,6 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 
-
 _STAGE_ORDER = {
     "exact_id": 0,
     "exact_symbol": 1,
@@ -36,7 +35,14 @@ class RetrievalConfig:
     docs_category_multiplier: float = 0.7
 
     # 模糊匹配最低阈值
-    fuzzy_min_similarity: float = 0.18
+    fuzzy_min_similarity: float = 0.35
+
+    # exact_symbol 同名命中数降权阈值
+    # 同名符号数超过此值时，分数 = base / log2(hit_count)
+    exact_symbol_hit_count_threshold: int = 3
+
+    # 词法阶段缩放倍数（让 lexical 能够与降权后的 exact_symbol 竞争）
+    lexical_scale: float = 2.5
 
     # BM25 字段权重
     field_boosts: dict[str, float] = field(default_factory=lambda: {
@@ -338,11 +344,26 @@ class CandidateRetriever:
                 )
         if exact_symbol:
             succeeded.append("exact_symbol")
+            # 统计每个 name 在全图中的命中总数（同名符号数）
+            symbol_hit_counts: dict[str, int] = {}
             for entry in exact_symbol:
+                name_key = entry.name.casefold()
+                total_hits = len(self._by_name.get(name_key, []))
+                symbol_hit_counts[name_key] = total_hits
+
+            for entry in exact_symbol:
+                hit_count = symbol_hit_counts.get(entry.name.casefold(), 1)
+                multiplier = 1.0
+                # 同名符号过多时降权：base / log2(hit_count)
+                if hit_count > cfg.exact_symbol_hit_count_threshold:
+                    multiplier = 1.0 / math.log2(hit_count)
+                # 含 :: 的限定名说明定位更精确，额外加分
+                if "::" in entry.id:
+                    multiplier *= 1.5
                 self._merge(
                     merged,
                     entry,
-                    cfg.exact_symbol_score * _category_multiplier(entry, query, cfg),
+                    cfg.exact_symbol_score * multiplier * _category_multiplier(entry, query, cfg),
                     "exact_symbol",
                     matched_terms=tokenize(entry.name),
                     matched_fields=["name"],
@@ -356,7 +377,7 @@ class CandidateRetriever:
                 self._merge(
                     merged,
                     entry,
-                    cfg.lexical_base + score,
+                    cfg.lexical_base + score * cfg.lexical_scale,
                     "lexical",
                     terms,
                     fields,
