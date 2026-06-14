@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, feature/*]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.11"
+      - name: 安装依赖
+        run: uv sync --group dev
+      - name: Ruff 检查 (E/F)
+        run: uv run ruff check mini_agent/ scripts/ --select E,F --ignore E501
+      - name: compileall
+        run: uv run python -m compileall -q mini_agent scripts
+      - name: uv pip check
+        run: uv pip check
+      - name: pytest
+        run: uv run pytest tests -v

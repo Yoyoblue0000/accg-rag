@@ -12,6 +12,7 @@ from accg.models import EdgeType, NodeId
 from .retrieval import (
     Candidate,
     CandidateRetriever,
+    DEFAULT_RETRIEVAL_CONFIG,
     RetrievalResult,
     build_entries,
     tokenize,
@@ -759,7 +760,7 @@ class GraphTool:
                     self.embedding_ranker.build_index(self._graph, summaries)
                     embedding_candidates = self.embedding_ranker.rank(
                         text,
-                        limit=limit,
+                        limit=DEFAULT_RETRIEVAL_CONFIG.recall_pool_limit,
                     )
                 except Exception as e:
                     embedding_error = str(e)
@@ -812,6 +813,7 @@ class GraphTool:
                 sources=list(item.get("sources", [])),
                 matched_terms=list(item.get("matched_terms", [])),
                 matched_fields=list(item.get("matched_fields", [])),
+                entity_names=list(item.get("entity_names", [])),
             ))
         anchors = []
         explicit_type_positions = []

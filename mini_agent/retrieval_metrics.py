@@ -8,7 +8,6 @@ import re
 import statistics
 from dataclasses import dataclass, field
 
-
 _SYMBOL_PATTERN = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*"
     r"(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?$"

@@ -1,7 +1,8 @@
 """输出所有 CLASS 节点及其边，用于人工检查"""
 from collections import defaultdict
+
 from accg.builder import GraphBuilder
-from accg.models import NodeType, EdgeType
+from accg.models import EdgeType, NodeType
 
 g = GraphBuilder().build("test_repos/requests_repo")
 

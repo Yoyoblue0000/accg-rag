@@ -19,9 +19,10 @@ import json
 import os
 import sys
 from pathlib import Path
-from mini_agent.model import Model, ModelConfig
-from mini_agent.environment import Environment, EnvConfig
+
 from mini_agent.agent import Agent
+from mini_agent.environment import EnvConfig, Environment
+from mini_agent.model import Model, ModelConfig
 
 
 def _estimate_tokens(text: str) -> int:

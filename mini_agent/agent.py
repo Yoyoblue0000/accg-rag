@@ -251,10 +251,14 @@ class Agent:
         self.last_model_requests: list[dict] = []
         self._full_tool_results: dict[str, str] = {}
         self.last_query_plan: dict = {}
-        self._entity_extractor = entity_extractor
+        self._entity_extractor = (
+            entity_extractor
+            if entity_extractor is not None
+            else EntityExtractor(model) if graph_tool else None
+        )
         self._orchestrator = (
             MultiEntityOrchestrator(graph_tool)
-            if graph_tool and entity_extractor
+            if graph_tool
             else None
         )
         self._gate = SufficiencyGate()
@@ -354,24 +358,9 @@ class Agent:
         retrieval_started_at = time.perf_counter()
 
         entities = []
-        if self._entity_extractor and self.graph_tool:
+        if self.graph_tool and self._entity_extractor:
             entities = self._entity_extractor.extract(task, max_entities=4)
             query_plan.entities = [e.to_dict() for e in entities]
-
-        # EntityExtractor 提取出的优化搜索词——优先使用
-        entity_search_text = task
-        if entities:
-            clean_queries = []
-            for e in entities:
-                q = e.query or e.name
-                tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", q)
-                if tokens:
-                    clean_queries.append(" ".join(tokens))
-                else:
-                    clean_queries.append(e.name)
-            entity_search_text = " ".join(clean_queries)
-            if len(entities) <= 1:
-                entity_search_text = clean_queries[0]
 
         if len(entities) > 1 and self._orchestrator:
             prelude_result = self._orchestrator.run(
@@ -387,12 +376,22 @@ class Agent:
             query_plan.prefetch_evidence_ids = list(
                 prelude_result.prefetch_evidence_ids
             )
-            for name, anchor_list in prelude_result.entity_anchors.items():
-                for anchor_data in anchor_list:
-                    anchor = self._make_anchor(anchor_data)
-                    anchor.display_level = anchor_data.get("display_level", "complete")
-                    anchor.omitted_reason = anchor_data.get("omitted_reason", "")
-                    query_plan.anchors.append(anchor)
+            candidates = [
+                candidate.to_dict()
+                for candidate in prelude_result.candidates
+            ]
+            query_plan.candidates = list(prelude_result.candidates)
+            for anchor_data in prelude_result.global_anchors:
+                anchor = self._make_anchor(anchor_data)
+                anchor.display_level = anchor_data.get(
+                    "display_level",
+                    "complete",
+                )
+                anchor.omitted_reason = anchor_data.get(
+                    "omitted_reason",
+                    "",
+                )
+                query_plan.anchors.append(anchor)
             query_plan.rejected_anchors = prelude_result.rejected_anchors
             query_plan.diagnostics.extend(prelude_result.diagnostics)
             query_plan.diagnostics.append(
@@ -407,7 +406,11 @@ class Agent:
                 status=self._derive_multi_entity_status(prelude_result),
             )
         elif self.graph_tool:
-            prelude, candidates = self._build_single_prelude(entity_search_text, query_plan)
+            search_text = entities[0].query if entities else task
+            prelude, candidates = self._build_single_prelude(
+                search_text,
+                query_plan,
+            )
 
         if self._retrieval_result is not None:
             self._retrieval_result.duration_ms = (
@@ -809,6 +812,11 @@ class Agent:
         """根据多实体检索结果推断状态。"""
         if not prelude_result.candidates:
             return "failed"
+        if (
+            "embedding" in prelude_result.stages_attempted
+            and "embedding" not in prelude_result.stages_succeeded
+        ):
+            return "fallback"
         if prelude_result.stages_succeeded:
             return "ok"
         if prelude_result.stages_attempted:

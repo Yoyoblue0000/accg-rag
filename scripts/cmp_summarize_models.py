@@ -7,8 +7,8 @@ import statistics
 import time
 from pathlib import Path
 
-from mini_agent.model import Model, ModelConfig
 from mini_agent.graph_tool import GraphTool
+from mini_agent.model import Model, ModelConfig
 
 SUMMARY_PROMPT = """You are a code analysis expert. Summarize the purpose of the following function in one sentence (max 50 words). Only output the summary, no explanation, no code.
 

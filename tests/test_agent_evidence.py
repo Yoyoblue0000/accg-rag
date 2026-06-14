@@ -5,8 +5,7 @@ import json
 
 import pytest
 
-from mini_agent.evidence import EvidenceItem, EvidenceLedger, DisplayLevel
-
+from mini_agent.evidence import DisplayLevel, EvidenceItem, EvidenceLedger
 
 # ═══════════════════════════════════════════════════════════════
 # EvidenceItem 创建与渲染

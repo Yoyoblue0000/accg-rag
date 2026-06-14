@@ -358,12 +358,14 @@ def main():
 
     verbosity = min(args.verbose, 2)
 
-    model = Model(ModelConfig(
-        base_url=args.base_url,
-        api_key="ollama",
-        model_name=args.model,
-        quiet=True,
-    ))
+    model = None
+    if not args.retrieval_only:
+        model = Model(ModelConfig(
+            base_url=args.base_url,
+            api_key="ollama",
+            model_name=args.model,
+            quiet=True,
+        ))
     env = Environment(EnvConfig(cwd=args.project_path))
     graph_tool = GraphTool(
         args.project_path,
@@ -472,14 +474,9 @@ def main():
         try:
             result = RunResult(answer="", error="未执行")
             if args.retrieval_only:
-                entity_extractor = EntityExtractor(model)
-                entities = entity_extractor.extract(question, max_entities=4)
-                search_text = question
-                if entities:
-                    search_text = " ".join(e.query or e.name for e in entities)
                 retrieval = graph_tool.retrieve_query_candidates(
-                    search_text,
-                    limit=10 if len(entities) <= 1 else 12,
+                    question,
+                    limit=10,
                     use_embeddings=args.embedding and not args.no_embedding,
                 )
                 candidate_dicts = [
@@ -503,7 +500,6 @@ def main():
                         "prefetch_evidence_ids": [],
                         "relation_expansions": [],
                         "diagnostics": list(retrieval.diagnostics),
-                        "entities": [e.to_dict() for e in entities],
                     },
                 )
             else:

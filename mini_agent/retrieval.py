@@ -19,16 +19,13 @@ _STAGE_ORDER = {
 
 @dataclass
 class RetrievalConfig:
-    """候选检索的可配置参数。各阶段分数为叠加值，层级差距确保排序稳定。"""
+    """候选检索的可配置参数。"""
 
-    # 阶段基础分
-    exact_id_score: float = 1000.0
-    exact_symbol_score: float = 300.0
-    lexical_base: float = 100.0
-    embedding_base: float = 80.0
-    embedding_scale: float = 80.0
-    fuzzy_base: float = 10.0
-    fuzzy_scale: float = 20.0
+    recall_pool_limit: int = 200
+    w_lexical: float = 0.35
+    w_embedding: float = 0.35
+    w_exact: float = 0.20
+    w_fuzzy: float = 0.10
 
     # 类别降权系数
     test_category_multiplier: float = 0.55
@@ -36,13 +33,6 @@ class RetrievalConfig:
 
     # 模糊匹配最低阈值
     fuzzy_min_similarity: float = 0.35
-
-    # exact_symbol 同名命中数降权阈值
-    # 同名符号数超过此值时，分数 = base / log2(hit_count)
-    exact_symbol_hit_count_threshold: int = 3
-
-    # 词法阶段缩放倍数
-    lexical_scale: float = 1.0
 
     # BM25 字段权重
     field_boosts: dict[str, float] = field(default_factory=lambda: {
@@ -61,12 +51,12 @@ class RetrievalConfig:
 # 保留模块级默认实例，供外部模块直接引用（向后兼容）
 DEFAULT_RETRIEVAL_CONFIG = RetrievalConfig()
 
-_STOP_WORDS = {
+STOP_WORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "between", "by", "does",
     "for", "from", "how", "in", "into", "is", "it", "of", "on", "or",
     "that", "the", "their", "this", "to", "what", "when", "where", "which",
     "who", "why", "with", "work", "works", "responsibility", "relationship",
-}
+})
 
 
 @dataclass
@@ -79,6 +69,7 @@ class Candidate:
     sources: list[str] = field(default_factory=list)
     matched_terms: list[str] = field(default_factory=list)
     matched_fields: list[str] = field(default_factory=list)
+    entity_names: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115,6 +106,18 @@ class _Entry:
     file: str
     category: str
     fields: dict[str, list[str]]
+
+
+@dataclass
+class _CandidateSignals:
+    entry: _Entry
+    norm_lexical: float = 0.0
+    norm_embedding: float = 0.0
+    exact_bonus: float = 0.0
+    fuzzy_bonus: float = 0.0
+    sources: set[str] = field(default_factory=set)
+    matched_terms: set[str] = field(default_factory=set)
+    matched_fields: set[str] = field(default_factory=set)
 
 
 def _stem_token(token: str) -> str:
@@ -157,7 +160,7 @@ def tokenize(text: str) -> list[str]:
     return [
         _stem_token(token)
         for token in raw_tokens
-        if token not in _STOP_WORDS and (len(token) > 1 or _is_cjk(token))
+        if token not in STOP_WORDS and (len(token) > 1 or _is_cjk(token))
     ]
 
 
@@ -326,95 +329,116 @@ class CandidateRetriever:
         embedding_attempted: bool = False,
         embedding_error: str | None = None,
     ) -> RetrievalResult:
-        """级联检索：召回层(lexical+embedding)→精确层(exact)→细化层(fuzzy)。"""
+        """四阶段级联：召回→精确→细化→加权排序。"""
         attempted: list[str] = []
         succeeded: list[str] = []
         diagnostics: list[str] = []
         cfg = self._config
 
-        # ════════════════════════════════════════════════════
-        # 第一层：召回 —— lexical + embedding 并行构建候选池
-        # ════════════════════════════════════════════════════
-        pool: dict[str, Candidate] = {}
-
+        # Stage 1: lexical 与 embedding 各自归一化，合并后截断召回池。
+        recall_signals: dict[str, _CandidateSignals] = {}
         attempted.append("lexical")
-        lexical = self._lexical_rank(query)
+        lexical = self._lexical_rank(query)[:cfg.recall_pool_limit]
         if lexical:
             succeeded.append("lexical")
+            _lex_scores = [score for _, score, _, _ in lexical if score > 0]
+            lexical_max = max(_lex_scores) if _lex_scores else 1.0
             for entry, score, terms, fields in lexical:
-                self._merge(
-                    pool, entry,
-                    cfg.lexical_base + score * cfg.lexical_scale,
-                    "lexical", terms, fields,
+                signals = recall_signals.setdefault(
+                    entry.id,
+                    _CandidateSignals(entry=entry),
                 )
+                signals.norm_lexical = score / lexical_max
+                signals.sources.add("lexical")
+                signals.matched_terms.update(terms)
+                signals.matched_fields.update(fields)
 
         if embedding_attempted:
             attempted.append("embedding")
             if embedding_error:
                 diagnostics.append(f"embedding 失败: {embedding_error}")
             elif embedding_candidates:
-                succeeded.append("embedding")
-                for item in embedding_candidates:
+                valid_embedding = []
+                for item in embedding_candidates[:cfg.recall_pool_limit]:
                     entry = self._by_id.get(str(item.get("id", "")))
                     if entry is None:
                         continue
                     score = max(0.0, float(item.get("score", 0.0)))
-                    self._merge(
-                        pool, entry,
-                        cfg.embedding_base + score * cfg.embedding_scale,
-                        "embedding", [], [],
-                    )
+                    if score > 0:
+                        valid_embedding.append((entry, score))
+                if valid_embedding:
+                    succeeded.append("embedding")
+                    _emb_scores = [score for _, score in valid_embedding]
+                    embedding_max = max(_emb_scores) if _emb_scores else 1.0
+                    for entry, score in valid_embedding:
+                        signals = recall_signals.setdefault(
+                            entry.id,
+                            _CandidateSignals(entry=entry),
+                        )
+                        signals.norm_embedding = score / embedding_max
+                        signals.sources.add("embedding")
+                else:
+                    diagnostics.append("embedding 未返回有效候选")
             else:
                 diagnostics.append("embedding 未返回候选")
 
-        # ════════════════════════════════════════════════════
-        # 第二层：精确 —— exact_id/exact_symbol 对池内候选 boost
-        # 池外候选也加入，但只有精确分（无 lexical/embedding 支撑）
-        # ════════════════════════════════════════════════════
+        ranked_recall = sorted(
+            recall_signals.values(),
+            key=lambda signals: (
+                -self._recall_score(signals),
+                self._category_rank(signals.entry.file, query),
+                signals.entry.id,
+            ),
+        )
+        pool = {
+            signals.entry.id: signals
+            for signals in ranked_recall[:cfg.recall_pool_limit]
+        }
+
+        # Stage 2: exact 只能提升召回池内候选。
         attempted.extend(["exact_id", "exact_symbol"])
         exact_id, exact_symbol = self._exact_matches(query)
-
-        if exact_id:
+        exact_id_in_pool = [entry for entry in exact_id if entry.id in pool]
+        if exact_id_in_pool:
             succeeded.append("exact_id")
-            for entry in exact_id:
-                in_pool = entry.id in pool
-                self._merge(
-                    pool, entry, cfg.exact_id_score, "exact_id",
-                    matched_terms=[entry.id],
-                    matched_fields=["id"],
-                )
-                if in_pool:
-                    diagnostics.append(f"exact_id 命中并提升: {entry.id}")
+            for entry in exact_id_in_pool:
+                signals = pool[entry.id]
+                signals.exact_bonus = 1.0
+                signals.sources.add("exact_id")
+                signals.matched_terms.add(entry.id)
+                signals.matched_fields.add("id")
 
-        if exact_symbol:
+        exact_symbol_in_pool = [
+            entry for entry in exact_symbol if entry.id in pool
+        ]
+        if exact_symbol_in_pool:
             succeeded.append("exact_symbol")
-            for entry in exact_symbol:
-                multiplier = 1.0
-                if "::" in entry.id:
-                    multiplier = 1.5
-                bonus = cfg.exact_symbol_score * multiplier * _category_multiplier(entry, query, cfg)
-                self._merge(
-                    pool, entry, bonus, "exact_symbol",
-                    matched_terms=tokenize(entry.name),
-                    matched_fields=["name"],
-                )
+            for entry in exact_symbol_in_pool:
+                signals = pool[entry.id]
+                signals.exact_bonus = 1.0
+                signals.sources.add("exact_symbol")
+                signals.matched_terms.update(tokenize(entry.name))
+                signals.matched_fields.add("name")
 
-        # ════════════════════════════════════════════════════
-        # 第三层：细化 —— fuzzy 对所有池内候选做文本对齐
-        # ════════════════════════════════════════════════════
+        # Stage 3: fuzzy 仅扫描召回池。
         attempted.append("fuzzy")
-        fuzzy = self._fuzzy_rank(query)
+        fuzzy = self._fuzzy_rank_for_pool(query, pool)
         if fuzzy:
             succeeded.append("fuzzy")
             for entry, score, terms, fields in fuzzy:
-                self._merge(
-                    pool, entry,
-                    cfg.fuzzy_base + score * cfg.fuzzy_scale,
-                    "fuzzy", terms, fields,
-                )
+                signals = pool[entry.id]
+                signals.fuzzy_bonus = score
+                signals.sources.add("fuzzy")
+                signals.matched_terms.update(terms)
+                signals.matched_fields.update(fields)
 
+        # Stage 4: 严格按四项权重计算最终相关度。
+        scored_candidates = [
+            self._to_candidate(signals)
+            for signals in pool.values()
+        ]
         candidates = sorted(
-            pool.values(),
+            scored_candidates,
             key=lambda item: (
                 -item.score,
                 self._category_rank(item.file, query),
@@ -434,6 +458,32 @@ class CandidateRetriever:
             stages_succeeded=succeeded,
             diagnostics=diagnostics,
             status=status,
+        )
+
+    def _recall_score(self, signals: _CandidateSignals) -> float:
+        return (
+            self._config.w_lexical * signals.norm_lexical
+            + self._config.w_embedding * signals.norm_embedding
+        )
+
+    def _to_candidate(self, signals: _CandidateSignals) -> Candidate:
+        score = (
+            self._recall_score(signals)
+            + self._config.w_exact * signals.exact_bonus
+            + self._config.w_fuzzy * signals.fuzzy_bonus
+        )
+        return Candidate(
+            id=signals.entry.id,
+            name=signals.entry.name,
+            type=signals.entry.type,
+            file=signals.entry.file,
+            score=round(score, 6),
+            sources=sorted(
+                signals.sources,
+                key=lambda item: _STAGE_ORDER[item],
+            ),
+            matched_terms=sorted(signals.matched_terms),
+            matched_fields=sorted(signals.matched_fields),
         )
 
     def _exact_matches(self, query: str) -> tuple[list[_Entry], list[_Entry]]:
@@ -528,13 +578,32 @@ class CandidateRetriever:
         self,
         query: str,
     ) -> list[tuple[_Entry, float, list[str], list[str]]]:
+        return self._fuzzy_rank_entries(query, self.entries)
+
+    def _fuzzy_rank_for_pool(
+        self,
+        query: str,
+        pool: dict[str, _CandidateSignals],
+    ) -> list[tuple[_Entry, float, list[str], list[str]]]:
+        entries = [
+            self._by_id[candidate_id]
+            for candidate_id in pool
+            if candidate_id in self._by_id
+        ]
+        return self._fuzzy_rank_entries(query, entries)
+
+    def _fuzzy_rank_entries(
+        self,
+        query: str,
+        entries: list[_Entry],
+    ) -> list[tuple[_Entry, float, list[str], list[str]]]:
         query_text = " ".join(tokenize(query))
         query_terms = set(query_text.split())
-        if not query_text:
+        if not query_text or not entries:
             return []
 
         ranked = []
-        for entry in self.entries:
+        for entry in entries:
             best_score = 0.0
             best_field = ""
             matched_terms = set()
@@ -554,7 +623,6 @@ class CandidateRetriever:
                     best_field = field_name
                     matched_terms = overlap
             if best_score >= self._config.fuzzy_min_similarity:
-                best_score *= _category_multiplier(entry, query, self._config)
                 ranked.append((
                     entry,
                     round(best_score, 6),
@@ -562,37 +630,6 @@ class CandidateRetriever:
                     [best_field] if best_field else [],
                 ))
         return sorted(ranked, key=lambda item: (-item[1], item[0].id))
-
-    @staticmethod
-    def _merge(
-        merged: dict[str, Candidate],
-        entry: _Entry,
-        score: float,
-        source: str,
-        matched_terms: list[str],
-        matched_fields: list[str],
-    ) -> None:
-        candidate = merged.get(entry.id)
-        if candidate is None:
-            candidate = Candidate(
-                id=entry.id,
-                name=entry.name,
-                type=entry.type,
-                file=entry.file,
-                score=0.0,
-            )
-            merged[entry.id] = candidate
-        candidate.score = round(candidate.score + score, 6)
-        candidate.sources = sorted(
-            set(candidate.sources) | {source},
-            key=lambda item: _STAGE_ORDER[item],
-        )
-        candidate.matched_terms = sorted(
-            set(candidate.matched_terms) | set(matched_terms)
-        )
-        candidate.matched_fields = sorted(
-            set(candidate.matched_fields) | set(matched_fields)
-        )
 
     @staticmethod
     def _category_rank(file_path: str, query: str) -> int:

@@ -9,7 +9,8 @@ from mini_agent.graph_tool import GraphTool
 from mini_agent.model import Model, ModelConfig
 from mini_agent.reranker import Reranker
 from mini_agent.retrieval_metrics import (
-    _normalize_symbol, extract_provisional_gold,
+    _normalize_symbol,
+    extract_provisional_gold,
 )
 
 qa = json.loads(Path("/home/amd-jk6kg8k/program/sqlfluff_qa.json").read_text())

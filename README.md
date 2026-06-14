@@ -51,10 +51,10 @@ Embedding 默认关闭；可用 `--embedding` 或单任务环境变量
 
 ```
 mini_agent/
-  agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT、收敛分析
+  agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT
   model.py        — LLM 接口：流式调用 + THOUGHT/ACTION 解析
   graph_tool.py   — 图查询工具：9 种 action + 可选 EmbeddingRanker
-  retrieval.py    — 精确/BM25/embedding/模糊候选检索级联
+  retrieval.py    — top-200 召回池上的四阶段加权检索级联
   retrieval_metrics.py — 临时 gold 抽取与检索指标
   environment.py  — 只读文件工具
 scripts/

@@ -1,8 +1,9 @@
 """全面检查图中 CLASS 相关的所有边（CONTAINS / INHERITS / CALLS）"""
 import sys
-from collections import deque, defaultdict
+from collections import defaultdict, deque
+
 from accg.builder import GraphBuilder
-from accg.models import NodeType, EdgeType
+from accg.models import EdgeType, NodeType
 
 
 def check(graph):

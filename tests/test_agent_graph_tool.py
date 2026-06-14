@@ -5,6 +5,7 @@ import copy
 import json
 
 import networkx as nx
+import pytest
 from accg.models import EdgeType, NodeType
 from accg.query import GraphQuery
 
@@ -12,6 +13,12 @@ from mini_agent.agent import Agent
 from mini_agent.environment import EnvConfig, Environment
 from mini_agent.evidence import EvidenceItem
 from mini_agent.graph_tool import GraphTool
+from mini_agent.multi_entity import EntityExtractor
+from mini_agent.retrieval import (
+    CandidateRetriever,
+    RetrievalConfig,
+    build_entries,
+)
 
 
 def _add_symbol(
@@ -178,8 +185,12 @@ def test_static_method_metadata_supports_indirect_query(tmp_path):
 
     candidates = tool.rank_query_candidates(query)
 
-    assert candidates[0]["name"] == "_get_indexes"
-    assert "decorator" in candidates[0]["matched_fields"]
+    target = next(
+        candidate
+        for candidate in candidates[:2]
+        if candidate["name"] == "_get_indexes"
+    )
+    assert "decorator" in target["matched_fields"]
 
 
 def test_exact_node_id_ranks_first(tmp_path):
@@ -286,10 +297,13 @@ def test_embedding_failure_returns_lexical_fallback(tmp_path):
 
 def test_candidate_merge_preserves_retrieval_sources(tmp_path):
     class _Ranker:
+        requested_limit = None
+
         def build_index(self, graph, summaries=None):
             return None
 
         def rank(self, query, limit=12):
+            self.requested_limit = limit
             return [{
                 "id": "src/utils.py::normalize_headers",
                 "name": "normalize_headers",
@@ -315,6 +329,151 @@ def test_candidate_merge_preserves_retrieval_sources(tmp_path):
     )
 
     assert {"lexical", "embedding"} <= set(result.candidates[0].sources)
+    assert tool.embedding_ranker.requested_limit == 200
+
+
+def test_weighted_score_uses_normalized_stage_signals(tmp_path):
+    class _Ranker:
+        def build_index(self, graph, summaries=None):
+            return None
+
+        def rank(self, query, limit=12):
+            return [
+                {
+                    "id": "src/target.py::target_func",
+                    "score": 0.5,
+                },
+                {
+                    "id": "src/other.py::other_func",
+                    "score": 1.0,
+                },
+            ]
+
+    graph = nx.MultiDiGraph()
+    _add_symbol(
+        graph,
+        "src/target.py::target_func",
+        NodeType.FUNCTION,
+        "target_func",
+        "src/target.py",
+    )
+    _add_symbol(
+        graph,
+        "src/other.py::other_func",
+        NodeType.FUNCTION,
+        "other_func",
+        "src/other.py",
+    )
+    tool = _graph_tool(graph, tmp_path)
+    tool.embedding_ranker = _Ranker()
+
+    result = tool.retrieve_query_candidates(
+        "target_func",
+        use_embeddings=True,
+    )
+
+    target = next(
+        candidate
+        for candidate in result.candidates
+        if candidate.id == "src/target.py::target_func"
+    )
+    assert target.score == pytest.approx(0.825)
+    assert set(target.sources) == {
+        "lexical",
+        "embedding",
+        "exact_symbol",
+        "fuzzy",
+    }
+    assert 0.0 <= target.score <= 1.0
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["exact_target", "z.py::exact_target"],
+)
+def test_exact_match_cannot_inject_candidate_outside_recall_pool(query):
+    graph = nx.MultiDiGraph()
+    _add_symbol(
+        graph,
+        "a.py::other",
+        NodeType.FUNCTION,
+        "other",
+        "a.py",
+    )
+    _add_symbol(
+        graph,
+        "z.py::exact_target",
+        NodeType.FUNCTION,
+        "exact_target",
+        "z.py",
+    )
+    retriever = CandidateRetriever(
+        build_entries(graph),
+        RetrievalConfig(recall_pool_limit=1),
+    )
+
+    result = retriever.retrieve(
+        query,
+        limit=10,
+        embedding_candidates=[{
+            "id": "a.py::other",
+            "score": 1.0,
+        }],
+        embedding_attempted=True,
+    )
+
+    assert [candidate.id for candidate in result.candidates] == [
+        "a.py::other",
+    ]
+    assert "exact_id" not in result.stages_succeeded
+    assert "exact_symbol" not in result.stages_succeeded
+
+
+def test_recall_pool_is_capped_at_two_hundred(tmp_path):
+    class _Ranker:
+        requested_limit = None
+
+        def build_index(self, graph, summaries=None):
+            return None
+
+        def rank(self, query, limit=12):
+            self.requested_limit = limit
+            return [
+                {
+                    "id": f"src/semantic_{index}.py::semantic_{index}",
+                    "score": 1.0 - index / 1000,
+                }
+                for index in range(200)
+            ]
+
+    graph = nx.MultiDiGraph()
+    for index in range(201):
+        _add_symbol(
+            graph,
+            f"src/shared_{index}.py::shared_{index}",
+            NodeType.FUNCTION,
+            f"shared_{index}",
+            f"src/shared_{index}.py",
+        )
+    for index in range(200):
+        _add_symbol(
+            graph,
+            f"src/semantic_{index}.py::semantic_{index}",
+            NodeType.FUNCTION,
+            f"semantic_{index}",
+            f"src/semantic_{index}.py",
+        )
+    tool = _graph_tool(graph, tmp_path)
+    tool.embedding_ranker = _Ranker()
+
+    result = tool.retrieve_query_candidates(
+        "shared",
+        limit=500,
+        use_embeddings=True,
+    )
+
+    assert len(result.candidates) == 200
+    assert tool.embedding_ranker.requested_limit == 200
 
 
 def test_fuzzy_fallback_handles_misspelled_symbol(tmp_path):
@@ -336,6 +495,27 @@ def test_fuzzy_fallback_handles_misspelled_symbol(tmp_path):
 
     assert result.candidates[0].id == "src/utils.py::get_environ_proxies"
     assert "fuzzy" in result.candidates[0].sources
+
+
+def test_fuzzy_does_not_scan_outside_empty_recall_pool(tmp_path):
+    graph = nx.MultiDiGraph()
+    _add_symbol(
+        graph,
+        "src/utils.py::get_environ_proxies",
+        NodeType.FUNCTION,
+        "get_environ_proxies",
+        "src/utils.py",
+    )
+    tool = _graph_tool(graph, tmp_path)
+
+    result = tool.retrieve_query_candidates(
+        "zzzzzzzz",
+        use_embeddings=False,
+    )
+
+    assert result.candidates == []
+    assert result.status == "failed"
+    assert "fuzzy" not in result.stages_succeeded
 
 
 def test_path_and_decorator_fields_are_searchable(tmp_path):
@@ -506,6 +686,53 @@ def test_agent_returns_result_when_embedding_is_unavailable(tmp_path):
     assert result.anchor_candidates
 
 
+def test_agent_single_entity_uses_cleaned_extractor_query(tmp_path):
+    class _RecordingGraphTool:
+        is_ready = True
+        enable_embeddings = False
+
+        def __init__(self):
+            self.search_calls = []
+
+        def ensure_built(self):
+            return "ready"
+
+        def search(self, query, limit=12, use_embeddings=None):
+            self.search_calls.append(query)
+            from mini_agent.retrieval import RetrievalResult
+            return RetrievalResult(
+                candidates=[],
+                stages_attempted=["lexical"],
+                stages_succeeded=[],
+                diagnostics=[],
+                status="failed",
+            )
+
+        def select_query_anchors(self, query, candidates, max_anchors=3):
+            return []
+
+    class _ExtractionModel:
+        def generate(self, messages):
+            return json.dumps([{
+                "name": "target_func",
+                "query": "How does target_func work",
+                "description": "",
+                "type_hint": "FUNCTION",
+            }])
+
+    tool = _RecordingGraphTool()
+    agent = Agent(
+        _FinalModel(),
+        Environment(EnvConfig(cwd=str(tmp_path))),
+        graph_tool=tool,
+        entity_extractor=EntityExtractor(_ExtractionModel()),
+    )
+
+    agent.run("Explain the target function.")
+
+    assert tool.search_calls == ["target_func"]
+
+
 def test_agent_retrieves_deep_candidate_pool_but_displays_top_eight(tmp_path):
     class _Retrieval:
         def __init__(self):
@@ -595,10 +822,29 @@ def test_agent_prefetches_query_anchors_before_model_selection(tmp_path):
     )
     tool = _graph_tool(graph, tmp_path)
     model = _FinalModel()
+
+    class _ExtractionModel:
+        def generate(self, messages):
+            return json.dumps([
+                {
+                    "name": "format_header",
+                    "query": "format_header",
+                    "description": "格式化头部",
+                    "type_hint": "FUNCTION",
+                },
+                {
+                    "name": "OutputFormatter",
+                    "query": "OutputFormatter",
+                    "description": "输出格式化器",
+                    "type_hint": "CLASS",
+                },
+            ])
+
     agent = Agent(
         model,
         Environment(EnvConfig(cwd=str(tmp_path))),
         graph_tool=tool,
+        entity_extractor=EntityExtractor(_ExtractionModel()),
     )
 
     result = agent.run(
@@ -614,6 +860,18 @@ def test_agent_prefetches_query_anchors_before_model_selection(tmp_path):
         "format_header",
         "OutputFormatter",
     }
+    assert {
+        candidate["name"]
+        for candidate in agent.last_query_plan["candidates"]
+    } == {"format_header", "OutputFormatter"}
+    assert {
+        candidate["name"]
+        for candidate in result.anchor_candidates
+    } == {"format_header", "OutputFormatter"}
+    assert all(
+        anchor["entity_names"]
+        for anchor in agent.last_query_plan["anchors"]
+    )
     user_message = model.last_messages[1]["content"]
     assert "[自动验证锚点的证据]" in user_message
     assert "format_header" in user_message
@@ -1203,10 +1461,10 @@ def test_agent_keeps_full_tool_result_while_budgeting_observation(tmp_path):
 
 
 class TestExactSymbolAnchor:
-    """exact_symbol :: 限定名加分 + fuzzy 阈值回归测试。"""
+    """exact_symbol 与 fuzzy 阈值回归测试。"""
 
-    def test_qualified_name_gets_bonus(self, tmp_path):
-        """含 :: 的限定名应比纯简单名分数高。"""
+    def test_qualified_name_lexical_match_ranks_first(self, tmp_path):
+        """限定名的额外词法命中应使其排在同名简单函数前。"""
         graph = nx.MultiDiGraph()
         _add_symbol(
             graph,

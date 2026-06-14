@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from .evidence import EvidenceItem, EvidenceLedger
-from .retrieval import Candidate
+from .retrieval import Candidate, STOP_WORDS
 
 
 @dataclass
@@ -36,6 +36,17 @@ _EXTRACTION_PROMPT = """\
 输出纯 JSON 数组，不要其他文字。
 
 问题: __QUESTION__"""
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def clean_entity_query(text: str) -> str:
+    """保留合法标识符 token，并删除检索停用词。"""
+    return " ".join(
+        token
+        for token in _IDENTIFIER_RE.findall(text)
+        if token.casefold() not in STOP_WORDS
+    )
 
 
 @dataclass
@@ -95,10 +106,16 @@ class EntityExtractor:
         for e in entities:
             if not e.name.strip():
                 continue
+            cleaned_query = clean_entity_query(e.query)
+            if not cleaned_query:
+                cleaned_query = clean_entity_query(e.name)
+            if not cleaned_query:
+                continue
             key = e.name.casefold()
             if key in seen:
                 continue
             seen.add(key)
+            e.query = cleaned_query
             filtered.append(e)
             if len(filtered) >= max_entities:
                 break
@@ -131,6 +148,54 @@ class EntityExtractor:
         return entities
 
 
+def _prefetch_anchor(
+    graph_tool,
+    anchor_data: dict,
+    ledger: EvidenceLedger,
+    step: int = 0,
+) -> tuple[dict | None, dict | None, list[str]]:
+    """验证并预取单个锚点。"""
+    validation = graph_tool.validate_query_anchor(anchor_data)
+    if not validation.get("valid"):
+        return None, {
+            "candidate": anchor_data,
+            "reason": validation.get("reason", "invalid"),
+            "message": validation.get("message", ""),
+            "suggestions": validation.get("suggestions", []),
+        }, []
+
+    raw = json.dumps(
+        graph_tool.inspect(anchor_data["id"]),
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    evidence_items = EvidenceItem.from_tool_result(
+        "query_graph",
+        {"action": "contextualize", "name": anchor_data["id"]},
+        raw,
+        step=step,
+    )
+    source_items = [
+        item for item in evidence_items
+        if item.kind == "source" and item.node_id == anchor_data["id"]
+    ]
+    if not source_items:
+        return None, {
+            "candidate": anchor_data,
+            "reason": "prefetch_without_source",
+            "message": "inspect 未返回锚点源码",
+            "suggestions": [],
+        }, []
+
+    for item in evidence_items:
+        ledger.add(item)
+
+    prefetch_ids = [item.evidence_id for item in source_items]
+    anchor_data["evidence_ids"] = list(prefetch_ids)
+    return anchor_data, None, prefetch_ids
+
+
 def _prefetch_anchors(graph_tool, ordered_anchors: list[dict],
                       max_anchors: int, ledger: EvidenceLedger, step: int = 0):
     """锚点验证+预取+证据写入。返回 (accepted, rejected, prefetch_evidence_ids)。"""
@@ -148,49 +213,17 @@ def _prefetch_anchors(graph_tool, ordered_anchors: list[dict],
             })
             continue
 
-        validation = graph_tool.validate_query_anchor(anchor_data)
-        if not validation.get("valid"):
-            rejected.append({
-                "candidate": anchor_data,
-                "reason": validation.get("reason", "invalid"),
-                "message": validation.get("message", ""),
-                "suggestions": validation.get("suggestions", []),
-            })
-            continue
-
-        raw = json.dumps(
-            graph_tool.inspect(anchor_data["id"]),
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        )
-        evidence_items = EvidenceItem.from_tool_result(
-            "query_graph",
-            {"action": "contextualize", "name": anchor_data["id"]},
-            raw,
+        anchor, rejection, anchor_prefetch_ids = _prefetch_anchor(
+            graph_tool,
+            anchor_data,
+            ledger,
             step=step,
         )
-        source_items = [
-            item for item in evidence_items
-            if item.kind == "source" and item.node_id == anchor_data["id"]
-        ]
-        if not source_items:
-            rejected.append({
-                "candidate": anchor_data,
-                "reason": "prefetch_without_source",
-                "message": "inspect 未返回锚点源码",
-                "suggestions": [],
-            })
+        if rejection is not None:
+            rejected.append(rejection)
             continue
-
-        for item in evidence_items:
-            ledger.add(item)
-
-        anchor_data["evidence_ids"] = [
-            item.evidence_id for item in source_items
-        ]
-        accepted.append(anchor_data)
-        prefetch_ids.extend(item.evidence_id for item in source_items)
+        accepted.append(anchor)
+        prefetch_ids.extend(anchor_prefetch_ids)
 
     return accepted, rejected, prefetch_ids
 
@@ -203,6 +236,8 @@ class MultiEntityPrelude:
     entity_anchors: dict[str, list[dict]] = field(default_factory=dict)
     entity_candidates: dict[str, list[dict]] = field(default_factory=dict)
     candidates: list[Candidate] = field(default_factory=list)
+    candidate_entities: dict[str, list[str]] = field(default_factory=dict)
+    global_anchors: list[dict] = field(default_factory=list)
     stages_attempted: list[str] = field(default_factory=list)
     stages_succeeded: list[str] = field(default_factory=list)
     rejected_anchors: list[dict] = field(default_factory=list)
@@ -211,14 +246,11 @@ class MultiEntityPrelude:
 
     @property
     def anchor_count(self) -> int:
-        return sum(len(v) for v in self.entity_anchors.values())
+        return len(self.global_anchors)
 
 
 class MultiEntityOrchestrator:
-    """对每个实体独立检索、选锚点、预取，合并为一个 prelude。
-
-    重排策略：各实体独立检索不做重排；合并候选后，由上层 Agent 统一执行在线重排。
-    """
+    """对每个实体独立检索，再合并候选并统一选择锚点。"""
 
     def __init__(self, graph_tool, config: MultiEntityConfig | None = None):
         self.graph_tool = graph_tool
@@ -232,64 +264,75 @@ class MultiEntityOrchestrator:
         recommended_count: int = 1,
     ) -> MultiEntityPrelude:
         prelude = MultiEntityPrelude()
-
-        per_entity_budget = max(
-            1, recommended_count // max(len(entities), 1)
-        )
-
         all_attempted: set[str] = set()
         all_succeeded: set[str] = set()
-        for entity in entities:
-            entity_section = self._process_entity(
-                entity=entity,
-                task=task,
-                ledger=ledger,
-                max_anchors=max(1, per_entity_budget),
-            )
-            for stage in entity_section.get("stages_attempted", []):
-                all_attempted.add(stage)
-            for stage in entity_section.get("stages_succeeded", []):
-                all_succeeded.add(stage)
-            self._merge_entity_result(entity, entity_section, prelude)
+        ordered_by_entity: dict[str, list[dict]] = {}
 
-        # 按 id 合并各实体候选，重复候选保留最高分
-        merged: dict[str, dict] = {}
-        for candidates in prelude.entity_candidates.values():
-            for c in candidates:
-                cid = c.get("id", "")
-                if cid not in merged or c.get("score", 0) > merged[cid].get("score", 0):
-                    merged[cid] = c
+        for entity in entities:
+            entity_section = self._retrieve_entity(entity)
+            for stage in entity_section["stages_attempted"]:
+                all_attempted.add(stage)
+            for stage in entity_section["stages_succeeded"]:
+                all_succeeded.add(stage)
+            prelude.entity_candidates[entity.name] = entity_section["candidates"]
+            prelude.entity_anchors[entity.name] = []
+            prelude.diagnostics.extend(entity_section["diagnostics"])
+            if entity_section["prelude_text"]:
+                if prelude.text:
+                    prelude.text += "\n"
+                prelude.text += entity_section["prelude_text"]
+
+            ordered_by_entity[entity.name] = [
+                {
+                    **candidate,
+                    "selection_reason": f"覆盖实体 {entity.name}",
+                    "covered_terms": list(
+                        candidate.get("matched_terms", [])
+                    ),
+                    "candidate_sources": list(
+                        candidate.get("sources", [])
+                    ),
+                }
+                for candidate in entity_section["candidates"]
+            ]
+
+        merged = self._merge_candidates(entities, prelude.entity_candidates)
+        prelude.candidate_entities = {
+            candidate_id: list(candidate["entity_names"])
+            for candidate_id, candidate in merged.items()
+        }
         prelude.candidates = [
-            Candidate(
-                id=c["id"], name=c.get("name", ""), type=c.get("type", ""),
-                file=c.get("file", ""), score=c.get("score", 0.0),
-                sources=list(c.get("sources", [])),
-                matched_terms=list(c.get("matched_terms", [])),
-                matched_fields=list(c.get("matched_fields", [])),
+            self._candidate_from_dict(candidate)
+            for candidate in sorted(
+                merged.values(),
+                key=lambda item: (-float(item.get("score", 0.0)), item["id"]),
             )
-            for c in merged.values()
         ]
         prelude.stages_attempted = sorted(all_attempted)
         prelude.stages_succeeded = sorted(all_succeeded)
+
+        self._select_global_anchors(
+            entities=entities,
+            ordered_by_entity=ordered_by_entity,
+            merged=merged,
+            max_anchors=max(0, recommended_count),
+            ledger=ledger,
+            prelude=prelude,
+        )
+        self._render_prefetch_evidence(ledger, prelude)
 
         if prelude.anchor_count == 0:
             prelude.diagnostics.append("所有实体均未通过锚点验证")
 
         return prelude
 
-    def _process_entity(
+    def _retrieve_entity(
         self,
         entity: Entity,
-        task: str,
-        ledger: EvidenceLedger,
-        max_anchors: int,
     ) -> dict:
-        """单实体完整检索流程。"""
+        """执行单实体检索并生成候选展示。"""
         result: dict = {
             "candidates": [],
-            "anchors": [],
-            "rejected": [],
-            "prefetch_ids": [],
             "prelude_text": "",
             "diagnostics": [],
             "stages_attempted": [],
@@ -315,6 +358,8 @@ class MultiEntityOrchestrator:
             c.to_dict() if hasattr(c, "to_dict") else dict(c)
             for c in retrieval.candidates
         ]
+        result["stages_attempted"] = list(retrieval.stages_attempted)
+        result["stages_succeeded"] = list(retrieval.stages_succeeded)
         if not candidates:
             result["diagnostics"].append(
                 f"[{entity.name}] 未检索到候选"
@@ -322,10 +367,7 @@ class MultiEntityOrchestrator:
             return result
 
         result["candidates"] = candidates
-        result["stages_attempted"] = list(retrieval.stages_attempted)
-        result["stages_succeeded"] = list(retrieval.stages_succeeded)
 
-        # 2. 候选展示
         display_items = []
         for c in candidates[:self._config.candidate_display_limit]:
             sources = ",".join(c.get("sources", []))
@@ -341,52 +383,208 @@ class MultiEntityOrchestrator:
             "与问题最相关的候选:",
             *display_items,
         ]
-
-        # 3. 锚点选择 + 验证 + 预取
-        ordered = self.graph_tool.select_query_anchors(
-            entity.query,
-            candidates,
-            max_anchors=len(candidates),
-        )
-        accepted, rejected, prefetch_ids = _prefetch_anchors(
-            self.graph_tool, ordered, max_anchors, ledger, step=0,
-        )
-        result["anchors"] = accepted
-        result["rejected"].extend(rejected)
-        result["prefetch_ids"] = prefetch_ids
-
-        # 4. 渲染预取证据
-        if result["prefetch_ids"]:
-            prefetched = [
-                item for item in ledger.source_items
-                if item.evidence_id in set(result["prefetch_ids"])
-            ]
-            evidence_text, display_reports = (
-                ledger.render_prefetch_evidence(prefetched)
-            )
-            prelude_parts.append("\n[自动验证锚点的证据]")
-            prelude_parts.append(evidence_text)
-            for report in display_reports:
-                for anchor in result["anchors"]:
-                    if report["evidence_id"] in anchor.get("evidence_ids", []):
-                        anchor["display_level"] = report["display_level"]
-                        anchor["omitted_reason"] = report["omitted_reason"]
-
         result["prelude_text"] = "\n".join(prelude_parts)
         return result
 
     @staticmethod
-    def _merge_entity_result(
-        entity: Entity,
-        result: dict,
+    def _merge_candidates(
+        entities: list[Entity],
+        entity_candidates: dict[str, list[dict]],
+    ) -> dict[str, dict]:
+        """按 ID 合并候选，保留最高分并合并来源元数据。"""
+        merged: dict[str, dict] = {}
+        for entity in entities:
+            for candidate in entity_candidates.get(entity.name, []):
+                candidate_id = str(candidate.get("id", ""))
+                if not candidate_id:
+                    continue
+                current = merged.get(candidate_id)
+                if current is None:
+                    current = {
+                        **candidate,
+                        "sources": list(candidate.get("sources", [])),
+                        "matched_terms": list(
+                            candidate.get("matched_terms", [])
+                        ),
+                        "matched_fields": list(
+                            candidate.get("matched_fields", [])
+                        ),
+                        "entity_names": [],
+                    }
+                    merged[candidate_id] = current
+                elif float(candidate.get("score", 0.0)) > float(
+                    current.get("score", 0.0)
+                ):
+                    for field_name in ("name", "type", "file", "score"):
+                        current[field_name] = candidate.get(
+                            field_name,
+                            current.get(field_name),
+                        )
+
+                current["sources"] = MultiEntityOrchestrator._ordered_union(
+                    current.get("sources", []),
+                    candidate.get("sources", []),
+                )
+                current["matched_terms"] = sorted(
+                    set(current.get("matched_terms", []))
+                    | set(candidate.get("matched_terms", []))
+                )
+                current["matched_fields"] = sorted(
+                    set(current.get("matched_fields", []))
+                    | set(candidate.get("matched_fields", []))
+                )
+                if entity.name not in current["entity_names"]:
+                    current["entity_names"].append(entity.name)
+        return merged
+
+    @staticmethod
+    def _ordered_union(first: list[str], second: list[str]) -> list[str]:
+        result = list(first)
+        for item in second:
+            if item not in result:
+                result.append(item)
+        return result
+
+    @staticmethod
+    def _candidate_from_dict(candidate: dict) -> Candidate:
+        return Candidate(
+            id=candidate["id"],
+            name=candidate.get("name", ""),
+            type=candidate.get("type", ""),
+            file=candidate.get("file", ""),
+            score=float(candidate.get("score", 0.0)),
+            sources=list(candidate.get("sources", [])),
+            matched_terms=list(candidate.get("matched_terms", [])),
+            matched_fields=list(candidate.get("matched_fields", [])),
+            entity_names=list(candidate.get("entity_names", [])),
+        )
+
+    def _select_global_anchors(
+        self,
+        entities: list[Entity],
+        ordered_by_entity: dict[str, list[dict]],
+        merged: dict[str, dict],
+        max_anchors: int,
+        ledger: EvidenceLedger,
         prelude: MultiEntityPrelude,
     ) -> None:
-        prelude.entity_anchors[entity.name] = result["anchors"]
-        prelude.entity_candidates[entity.name] = result["candidates"]
-        prelude.rejected_anchors.extend(result["rejected"])
-        prelude.prefetch_evidence_ids.extend(result["prefetch_ids"])
-        prelude.diagnostics.extend(result["diagnostics"])
-        if result["prelude_text"]:
-            if prelude.text:
-                prelude.text += "\n"
-            prelude.text += result["prelude_text"]
+        """优先覆盖每个实体，再按全局分数补足锚点。"""
+        if max_anchors <= 0:
+            return
+
+        accepted_by_id: dict[str, dict] = {}
+        rejected_ids: set[str] = set()
+
+        def accept_candidate(candidate: dict) -> bool:
+            candidate_id = candidate["id"]
+            if candidate_id in accepted_by_id:
+                return True
+            if candidate_id in rejected_ids:
+                return False
+
+            anchor_data = {
+                **candidate,
+                "entity_names": list(
+                    merged[candidate_id].get("entity_names", [])
+                ),
+            }
+            anchor, rejection, prefetch_ids = _prefetch_anchor(
+                self.graph_tool,
+                anchor_data,
+                ledger,
+                step=0,
+            )
+            if rejection is not None:
+                prelude.rejected_anchors.append(rejection)
+                rejected_ids.add(candidate_id)
+                return False
+
+            accepted_by_id[candidate_id] = anchor
+            prelude.global_anchors.append(anchor)
+            prelude.prefetch_evidence_ids.extend(prefetch_ids)
+            for entity_name in anchor.get("entity_names", []):
+                entity_anchors = prelude.entity_anchors.setdefault(
+                    entity_name,
+                    [],
+                )
+                if not any(
+                    item["id"] == candidate_id for item in entity_anchors
+                ):
+                    entity_anchors.append(anchor)
+            return True
+
+        covered_entities: set[str] = set()
+        for entity in entities:
+            if len(accepted_by_id) >= max_anchors:
+                break
+            if entity.name in covered_entities:
+                continue
+            for ordered_candidate in ordered_by_entity.get(entity.name, []):
+                candidate_id = ordered_candidate.get("id", "")
+                if candidate_id not in merged:
+                    continue
+                candidate = {
+                    **merged[candidate_id],
+                    **{
+                        key: value
+                        for key, value in ordered_candidate.items()
+                        if key in {
+                            "selection_reason",
+                            "covered_terms",
+                            "candidate_sources",
+                        }
+                    },
+                }
+                if accept_candidate(candidate):
+                    covered_entities.update(
+                        merged[candidate_id].get("entity_names", [])
+                    )
+                    break
+
+        if len(accepted_by_id) < max_anchors:
+            for candidate in prelude.candidates:
+                if len(accepted_by_id) >= max_anchors:
+                    break
+                candidate_id = candidate.id
+                if candidate_id in merged:
+                    accept_candidate({
+                        **merged[candidate_id],
+                        "selection_reason": "按全局 final_score 补足锚点",
+                        "covered_terms": list(candidate.matched_terms),
+                        "candidate_sources": list(candidate.sources),
+                    })
+
+        for candidate in prelude.candidates:
+            if (
+                candidate.id in accepted_by_id
+                or candidate.id in rejected_ids
+            ):
+                continue
+            prelude.rejected_anchors.append({
+                "candidate": candidate.to_dict(),
+                "reason": "max_anchor_limit",
+                "message": f"已达锚点上限 ({max_anchors})",
+                "suggestions": [],
+            })
+
+    @staticmethod
+    def _render_prefetch_evidence(
+        ledger: EvidenceLedger,
+        prelude: MultiEntityPrelude,
+    ) -> None:
+        if not prelude.prefetch_evidence_ids:
+            return
+
+        prefetched = [
+            item for item in ledger.source_items
+            if item.evidence_id in set(prelude.prefetch_evidence_ids)
+        ]
+        evidence_text, display_reports = ledger.render_prefetch_evidence(
+            prefetched
+        )
+        prelude.text += "\n\n[自动验证锚点的证据]\n" + evidence_text
+        for report in display_reports:
+            for anchor in prelude.global_anchors:
+                if report["evidence_id"] in anchor.get("evidence_ids", []):
+                    anchor["display_level"] = report["display_level"]
+                    anchor["omitted_reason"] = report["omitted_reason"]

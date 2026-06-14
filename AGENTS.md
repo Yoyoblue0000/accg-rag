@@ -17,7 +17,7 @@ mini_agent/
   sufficiency.py  — FinishAction 解析、确定性证据充分性门控、受控扩展计划
 scripts/
   run_agent.py    — 单任务入口
-  run_qa.py       — QA 批量评估入口（支持 --json、--id、即时写入）
+  run_qa.py       — QA 批量评估入口
   analyze_candidates.py — embedding 候选相关性分析
 tests/
   test_agent_model.py      — model 层解析测试

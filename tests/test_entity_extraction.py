@@ -3,8 +3,6 @@
 
 import json
 
-import pytest
-
 from mini_agent.multi_entity import Entity, EntityExtractor
 
 
@@ -56,6 +54,53 @@ def test_extract_relation_question():
     entities = extractor.extract("How does parse invoke render?")
     assert len(entities) == 2
     assert all(e.type_hint == "FUNCTION" for e in entities)
+
+
+def test_entity_query_keeps_identifiers_and_removes_stop_words():
+    extractor = EntityExtractor(_FakeModel(json.dumps([
+        {
+            "name": "format_header",
+            "query": "How DOES pkg.format_header work with OutputStream",
+            "description": "格式化函数",
+            "type_hint": "FUNCTION",
+        },
+    ])))
+
+    entities = extractor.extract("What does format_header do?")
+
+    assert entities[0].query == "pkg format_header OutputStream"
+
+
+def test_empty_cleaned_query_falls_back_to_cleaned_entity_name():
+    extractor = EntityExtractor(_FakeModel(json.dumps([
+        {
+            "name": "ValidSymbol",
+            "query": "how does it work",
+            "description": "",
+            "type_hint": "FUNCTION",
+        },
+    ])))
+
+    entities = extractor.extract("What does ValidSymbol do?")
+
+    assert entities[0].query == "ValidSymbol"
+
+
+def test_all_invalid_cleaned_entities_fall_back_to_original_question():
+    question = "解释这个中文概念"
+    extractor = EntityExtractor(_FakeModel(json.dumps([
+        {
+            "name": "123",
+            "query": "!!!",
+            "description": "",
+            "type_hint": "CONCEPT",
+        },
+    ])))
+
+    entities = extractor.extract(question)
+
+    assert len(entities) == 1
+    assert entities[0].query == question
 
 
 def test_fallback_on_invalid_json():

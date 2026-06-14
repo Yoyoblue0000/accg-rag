@@ -18,6 +18,7 @@ class Anchor:
     sources: list[str] = field(default_factory=list)
     matched_terms: list[str] = field(default_factory=list)
     matched_fields: list[str] = field(default_factory=list)
+    entity_names: list[str] = field(default_factory=list)
     selection_reason: str = ""
     covered_terms: list[str] = field(default_factory=list)
     candidate_sources: list[str] = field(default_factory=list)
@@ -38,6 +39,7 @@ class Anchor:
             sources=list(item.get("sources", [])),
             matched_terms=list(item.get("matched_terms", [])),
             matched_fields=list(item.get("matched_fields", [])),
+            entity_names=list(item.get("entity_names", [])),
             selection_reason=str(item.get("selection_reason", "")),
             covered_terms=list(item.get("covered_terms", [])),
             candidate_sources=list(

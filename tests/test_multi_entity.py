@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """多实体并行检索编排器测试。"""
 
-import json
 
 import networkx as nx
-import pytest
-
 from accg.models import NodeType
-from mini_agent.multi_entity import Entity
+
 from mini_agent.evidence import EvidenceLedger
-from mini_agent.multi_entity import MultiEntityOrchestrator, MultiEntityPrelude
+from mini_agent.multi_entity import Entity, MultiEntityOrchestrator
 from mini_agent.retrieval import Candidate, RetrievalResult
 
 
@@ -58,6 +55,8 @@ class _StubGraphTool:
         self._graph = graph
         self._built = True
         self._candidates_by_query = candidates_by_query or {}
+        self.search_calls = []
+        self.inspect_calls = []
         self._default_candidates = [
             Candidate(
                 id="src/a.py::format_header",
@@ -77,6 +76,7 @@ class _StubGraphTool:
         return True
 
     def search(self, query, limit=24, use_embeddings=None):
+        self.search_calls.append(query)
         candidates = self._candidates_by_query.get(
             query, self._default_candidates
         )
@@ -114,6 +114,7 @@ class _StubGraphTool:
         }
 
     def inspect(self, node_id):
+        self.inspect_calls.append(node_id)
         node = self._graph.nodes.get(node_id, {})
         return {
             "results": [{
@@ -182,6 +183,10 @@ def test_per_entity_retrieval_finds_both_symbols(tmp_path):
     assert "src/b.py::OutputStreamFormatter" in anchor_ids
     # 账本有两条 source 证据
     assert len(ledger.source_items) == 2
+    assert stub.search_calls == [
+        "format_header",
+        "OutputStreamFormatter",
+    ]
 
 
 def test_prelude_text_includes_both_entities(tmp_path):
@@ -376,17 +381,21 @@ class TestMultiEntityCandidateRecording:
         assert len(prelude.candidates) >= 2
 
     def test_duplicate_candidate_keeps_highest_score(self, tmp_path):
-        """同一 id 的候选被两个实体命中时保留最高分。"""
+        """同一 id 保留最高分，并合并来源与实体元数据。"""
         graph = _build_graph_with_two_symbols(tmp_path)
         candidate = Candidate(
             id="src/a.py::shared_func",
             name="shared_func", type="FUNCTION",
-            file="src/a.py", score=100.0, sources=["lexical"],
+            file="src/a.py", score=0.6, sources=["lexical"],
+            matched_terms=["entity_a"],
+            matched_fields=["name"],
         )
         stronger = Candidate(
             id="src/a.py::shared_func",
             name="shared_func", type="FUNCTION",
-            file="src/a.py", score=300.0, sources=["exact_symbol"],
+            file="src/a.py", score=0.8, sources=["exact_symbol"],
+            matched_terms=["entity_b"],
+            matched_fields=["signature"],
         )
         stub = _StubGraphTool(graph, {
             "entity_a": [candidate],
@@ -408,7 +417,52 @@ class TestMultiEntityCandidateRecording:
 
         shared = [c for c in prelude.candidates if c.id == "src/a.py::shared_func"]
         assert len(shared) == 1
-        assert shared[0].score == 300.0
+        assert shared[0].score == 0.8
+        assert set(shared[0].sources) == {"lexical", "exact_symbol"}
+        assert shared[0].matched_terms == ["entity_a", "entity_b"]
+        assert shared[0].matched_fields == ["name", "signature"]
+        assert shared[0].entity_names == ["A", "B"]
+        assert prelude.candidate_entities[shared[0].id] == ["A", "B"]
+
+    def test_shared_candidate_is_prefetched_once_and_covers_both_entities(
+        self,
+        tmp_path,
+    ):
+        graph = _build_graph_with_two_symbols(tmp_path)
+        shared = Candidate(
+            id="src/a.py::format_header",
+            name="format_header",
+            type="FUNCTION",
+            file="src/a.py",
+            score=0.9,
+            sources=["lexical", "exact_symbol"],
+        )
+        stub = _StubGraphTool(graph, {
+            "first_query": [shared],
+            "second_query": [shared],
+        })
+        orch = MultiEntityOrchestrator(stub)
+        ledger = EvidenceLedger()
+
+        prelude = orch.run(
+            entities=[
+                Entity(name="First", query="first_query"),
+                Entity(name="Second", query="second_query"),
+            ],
+            task="Compare First and Second",
+            ledger=ledger,
+            recommended_count=2,
+        )
+
+        assert prelude.anchor_count == 1
+        assert len(prelude.global_anchors) == 1
+        assert stub.inspect_calls == ["src/a.py::format_header"]
+        assert prelude.global_anchors[0]["entity_names"] == [
+            "First",
+            "Second",
+        ]
+        assert prelude.entity_anchors["First"][0]["id"] == shared.id
+        assert prelude.entity_anchors["Second"][0]["id"] == shared.id
 
     def test_retrieval_result_includes_candidates(self, tmp_path):
         """MultiEntityOrchestrator.run 返回的 prelude.candidates 包含正确的 Candidate 列表。"""

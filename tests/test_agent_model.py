@@ -2,18 +2,15 @@
 """model.py 解析器测试 —— 覆盖 THOUGHT/ACTION 协议的全体变体"""
 
 import json
-import re
 import uuid
-import pytest
 from unittest.mock import patch
 
 from mini_agent.model import (
+    _make_tool_calls,
     _parse_action_json,
     _robust_json_parse,
-    _make_tool_calls,
     _split_thought_and_actions,
 )
-
 
 # ═══════════════════════════════════════════
 # _parse_action_json

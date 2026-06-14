@@ -13,7 +13,7 @@ mini_agent/
   agent.py         — ReAct 循环、SYSTEM_PROMPT/ANSWER_PROMPT、锚点预取、扩展执行、消息压缩
   model.py         — LLM 接口：流式调用 + THOUGHT/ACTION/FINAL 解析 + finish_reason 捕获
   graph_tool.py    — 图查询工具：9 种 action + EmbeddingRanker（摘要向量增强 + 磁盘缓存）
-  retrieval.py     — 5 阶段级联检索 + 候选排序 + 锚点选择 + RetrievalConfig 可配置参数
+  retrieval.py     — 4 阶段加权级联检索 + 候选排序 + 锚点选择
   sufficiency.py   — FinishAction 解析、确定性证据充分性门控、受控扩展计划、GateConfig
   evidence.py      — 证据账本：分层展示（COMPLETE/PREVIEW/SNIPPET/FOLD）、预算控制、合成选择
   environment.py   — 只读文件工具：read_file / list_dir
@@ -22,7 +22,7 @@ mini_agent/
   reranker.py      — 可选在线重排器（小模型二次排序候选人）
 scripts/
   run_agent.py          — 单任务入口
-  run_qa.py             — QA 批量评估（支持 --json、--id、--embedding、即时写入）
+  run_qa.py             — QA 批量评估（支持 --id、--embedding、即时写入）
   build_summary_index.py — 离线 7B 摘要索引构建（用于 embedding 增强）
 tests/
   test_agent_model.py      — model 层解析测试
@@ -41,7 +41,7 @@ uv venv && uv pip install -e .
 # 本地单题测试
 .venv/Scripts/python.exe scripts/run_agent.py "问题描述"
 
-# 运行全部测试（162 条）
+# 运行全部测试（234 条）
 .venv/Scripts/python.exe -m pytest tests/ -v
 
 # 运行单个测试文件
@@ -85,7 +85,7 @@ FINAL: <最终答案>
 Agent.run(task)
   │
   ├─ 1. 建图 + EmbeddingRanker.build_index（首次慢，磁盘缓存加速）
-  ├─ 2. 5 阶段级联检索候选 → 锚点选择（分数驱动，类型仅平局打破）
+  ├─ 2. EntityExtractor → 按实体执行 4 阶段级联检索 → 合并候选并选择锚点
   ├─ 3. 验证锚点 → 预取源码 → 构建系统提示
   ├─ 4. ReAct 循环（max 15 步）
   │     └─ model.query() → THOUGHT/ACTION 解析 → 工具执行 → 证据收集
@@ -112,17 +112,22 @@ Agent.run(task)
 - **RetrievalConfig / GateConfig**：检索分数/权重/乘数和门控阈值集中为可配置 dataclass
 - **重复调用拦截**：最近 5 条 action 去重 + contextualize 符号去重
 
-## 5 阶段级联检索
+## 4 阶段加权级联检索
 
-| 阶段 | 基础分 | 说明 |
-|------|--------|------|
-| exact_id | 1000 | 精确 Node ID 匹配 |
-| exact_symbol | 900 × 类别乘数 | 精确符号名匹配 |
-| lexical | 100 + BM25F | 字段加权词匹配（summary 权重最高 5.0） |
-| embedding | 80 + cos×80 | 语义向量相似度 |
-| fuzzy | 10 + score×20 | 字符串模糊匹配回退 |
+1. **RECALL**：lexical 与 embedding 各取 top-200，分别按本次查询最大正分归一化，合并后截断为 200 条召回池。
+2. **PRECISION**：`exact_id` / `exact_symbol` 仅提升召回池内候选，不从池外注入条目。
+3. **REFINEMENT**：fuzzy 仅对召回池做文本对齐。
+4. **RANKING**：按固定权重计算 `0..1` 相关度并稳定排序。
 
-同一候选多阶段命中时分数叠加。候选按分数降序排列，源码优先于文档/测试。
+```text
+final_score =
+    0.35 * norm_lexical
+  + 0.35 * norm_embedding
+  + 0.20 * exact_bonus
+  + 0.10 * fuzzy_bonus
+```
+
+Agent 检索前强制运行 `EntityExtractor`。单实体使用清洗后的 `entity.query`；多实体分别检索后按 ID 合并，并优先保证每个实体都有锚点覆盖。提取失败时回退到原问题全文。
 
 ## 服务器验证
 

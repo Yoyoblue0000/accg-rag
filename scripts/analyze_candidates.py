@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from mini_agent.graph_tool import GraphTool, EmbeddingRanker, _split_camel
+from mini_agent.graph_tool import EmbeddingRanker, GraphTool, _split_camel
 
 
 def analyze(project_path: str, qa_path: str, limit: int = 10):
