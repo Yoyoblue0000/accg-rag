@@ -699,9 +699,8 @@ def test_finish_reason_stop_cannot_bypass_relation_gate(tmp_path):
     assert expansion["status"] == "completed"
     assert expansion["result_count"] == 0
     synthesis_prompt = model.generate_messages[0]["content"]
-    assert "限定搜索记录" in synthesis_prompt
-    assert "max_depth=2" in synthesis_prompt
-    assert "min_confidence=0.45" in synthesis_prompt
+    assert "isolated_function" in synthesis_prompt
+    assert "What calls isolated_function?" in synthesis_prompt
 
 
 def test_auto_expansion_error_is_not_recorded_as_completed(tmp_path):

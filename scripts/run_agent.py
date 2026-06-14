@@ -121,7 +121,7 @@ def main():
             context_dumps.append(audit_text)
 
     from mini_agent.graph_tool import GraphTool
-    from mini_agent.entity_extractor import EntityExtractor
+    from mini_agent.multi_entity import EntityExtractor
     graph_tool = GraphTool(
         project_path,
         enable_embeddings=enable_embeddings,

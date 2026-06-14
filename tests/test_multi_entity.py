@@ -7,7 +7,7 @@ import networkx as nx
 import pytest
 
 from accg.models import NodeType
-from mini_agent.entity_extractor import Entity
+from mini_agent.multi_entity import Entity
 from mini_agent.evidence import EvidenceLedger
 from mini_agent.multi_entity import MultiEntityOrchestrator, MultiEntityPrelude
 from mini_agent.retrieval import Candidate, RetrievalResult

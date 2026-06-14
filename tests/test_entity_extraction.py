@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from mini_agent.entity_extractor import Entity, EntityExtractor
+from mini_agent.multi_entity import Entity, EntityExtractor
 
 
 class _FakeModel:
