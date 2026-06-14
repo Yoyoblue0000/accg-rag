@@ -346,6 +346,7 @@ def main():
         help="QA JSON 路径",
     )
     parser.add_argument("--limit", type=int, default=0, help="分析前 N 题（0=全部）")
+    parser.add_argument("--embedding", action="store_true", help="启用 embedding 语义检索")
     parser.add_argument("--id", type=int, nargs="+", help="只分析指定题号")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="-v 显示完整候选列表")
     parser.add_argument(
@@ -375,7 +376,7 @@ def main():
     print(f"QA: {qa_path} ({len(indices)}/{total_available} 题)")
     print("初始化图工具...")
 
-    gt = GraphTool(str(proj_path), enable_embeddings=False)
+    gt = GraphTool(str(proj_path), enable_embeddings=args.embedding)
     print(gt.ensure_built())
 
     diagnoses = []
@@ -387,7 +388,7 @@ def main():
 
         # 检索
         retrieval = gt.retrieve_query_candidates(
-            question, limit=24, use_embeddings=False
+            question, limit=24, use_embeddings=args.embedding
         )
         candidate_dicts = [c.to_dict() for c in retrieval.candidates]
 
