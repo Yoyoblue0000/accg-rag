@@ -251,7 +251,7 @@ class Agent:
         self.last_query_plan: dict = {}
         self._entity_extractor = entity_extractor
         self._orchestrator = (
-            MultiEntityOrchestrator(graph_tool, reranker)
+            MultiEntityOrchestrator(graph_tool)
             if graph_tool and entity_extractor
             else None
         )
@@ -385,10 +385,10 @@ class Agent:
                 f"{prelude_result.anchor_count} 个有效锚点"
             )
             self._retrieval_result = RetrievalResult(
-                candidates=[],
-                stages_attempted=[],
-                stages_succeeded=[],
-                diagnostics=["多实体路径，见 query_plan.entities"],
+                candidates=prelude_result.candidates,
+                stages_attempted=list(prelude_result.stages_attempted),
+                stages_succeeded=list(prelude_result.stages_succeeded),
+                diagnostics=list(prelude_result.diagnostics),
             )
         elif self.graph_tool:
             prelude, candidates = self._build_single_prelude(task, query_plan)
@@ -445,7 +445,7 @@ class Agent:
                     + (f", 原因: {rerank_result.reasoning}" if rerank_result.reasoning else "")
                 )
                 if rerank_result.passed:
-                    candidates = self._reranker.apply(task, candidates)
+                    candidates = self._reranker.apply(task, candidates, rerank_result=rerank_result)
             except Exception as e:
                 rerank_info = {"error": str(e)}
                 query_plan.diagnostics.append(f"重排失败: {e}")
@@ -746,7 +746,7 @@ class Agent:
                 if not intercepted:
                     self._full_tool_results[tc["id"]] = obs_raw
 
-        return _make_result(answer="[达到最大步数]")
+        return _make_result(answer="[达到最大步数]", error=f"达到最大步数({self.max_steps})，任务未完成")
 
     @staticmethod
     def _register_dynamic_anchors(

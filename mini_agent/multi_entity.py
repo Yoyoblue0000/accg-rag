@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 
 from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
+from .retrieval import Candidate, RetrievalResult
 
 
 _EXTRACTION_PROMPT = """\
@@ -171,6 +172,10 @@ class MultiEntityPrelude:
 
     text: str = ""
     entity_anchors: dict[str, list[dict]] = field(default_factory=dict)
+    entity_candidates: dict[str, list[dict]] = field(default_factory=dict)
+    candidates: list[Candidate] = field(default_factory=list)
+    stages_attempted: list[str] = field(default_factory=list)
+    stages_succeeded: list[str] = field(default_factory=list)
     rejected_anchors: list[dict] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     prefetch_evidence_ids: list[str] = field(default_factory=list)
@@ -185,9 +190,8 @@ class MultiEntityOrchestrator:
 
     CANDIDATE_DISPLAY_LIMIT = 6
 
-    def __init__(self, graph_tool, reranker=None):
+    def __init__(self, graph_tool):
         self.graph_tool = graph_tool
-        self._reranker = reranker
 
     def run(
         self,
@@ -202,6 +206,7 @@ class MultiEntityOrchestrator:
             1, recommended_count // max(len(entities), 1)
         )
 
+        all_stages: set[str] = set()
         for entity in entities:
             entity_section = self._process_entity(
                 entity=entity,
@@ -209,7 +214,29 @@ class MultiEntityOrchestrator:
                 ledger=ledger,
                 max_anchors=max(1, per_entity_budget),
             )
+            all_stages.update(entity_section.get("stages_attempted", []))
+            all_stages.update(entity_section.get("stages_succeeded", []))
             self._merge_entity_result(entity, entity_section, prelude)
+
+        # 按 id 合并各实体候选，重复候选保留最高分
+        merged: dict[str, dict] = {}
+        for candidates in prelude.entity_candidates.values():
+            for c in candidates:
+                cid = c.get("id", "")
+                if cid not in merged or c.get("score", 0) > merged[cid].get("score", 0):
+                    merged[cid] = c
+        prelude.candidates = [
+            Candidate(
+                id=c["id"], name=c.get("name", ""), type=c.get("type", ""),
+                file=c.get("file", ""), score=c.get("score", 0.0),
+                sources=list(c.get("sources", [])),
+                matched_terms=list(c.get("matched_terms", [])),
+                matched_fields=list(c.get("matched_fields", [])),
+            )
+            for c in merged.values()
+        ]
+        prelude.stages_attempted = sorted(all_stages)
+        prelude.stages_succeeded = sorted(all_stages)
 
         if prelude.anchor_count == 0:
             prelude.diagnostics.append("所有实体均未通过锚点验证")
@@ -231,6 +258,8 @@ class MultiEntityOrchestrator:
             "prefetch_ids": [],
             "prelude_text": "",
             "diagnostics": [],
+            "stages_attempted": [],
+            "stages_succeeded": [],
         }
 
         # 1. 检索
@@ -257,6 +286,8 @@ class MultiEntityOrchestrator:
             return result
 
         result["candidates"] = candidates
+        result["stages_attempted"] = list(retrieval.stages_attempted)
+        result["stages_succeeded"] = list(retrieval.stages_succeeded)
 
         # 2. 候选展示
         display_items = []
@@ -315,6 +346,7 @@ class MultiEntityOrchestrator:
         prelude: MultiEntityPrelude,
     ) -> None:
         prelude.entity_anchors[entity.name] = result["anchors"]
+        prelude.entity_candidates[entity.name] = result["candidates"]
         prelude.rejected_anchors.extend(result["rejected"])
         prelude.prefetch_evidence_ids.extend(result["prefetch_ids"])
         prelude.diagnostics.extend(result["diagnostics"])

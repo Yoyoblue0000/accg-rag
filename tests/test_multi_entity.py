@@ -330,3 +330,112 @@ def test_entity_anchors_record_entity_name(tmp_path):
     )
 
     assert prelude.entity_anchors["format_header"][0]["id"] == "src/a.py::format_header"
+
+
+class TestMultiEntityCandidateRecording:
+    """验证多实体编排保存候选并生成可评估的检索指标。"""
+
+    def test_two_entities_hit_two_symbols(self, tmp_path):
+        """两个实体分别命中两个符号，prelude.candidates 包含两者。"""
+        graph = _build_graph_with_two_symbols(tmp_path)
+        stub = _StubGraphTool(graph, {
+            "calculate_tax": [
+                Candidate(
+                    id="src/a.py::calculate_tax",
+                    name="calculate_tax", type="FUNCTION",
+                    file="src/a.py", score=200.0, sources=["lexical"],
+                ),
+            ],
+            "format_header": [
+                Candidate(
+                    id="src/b.py::format_header",
+                    name="format_header", type="FUNCTION",
+                    file="src/b.py", score=150.0, sources=["lexical"],
+                ),
+            ],
+        })
+        orch = MultiEntityOrchestrator(stub)
+        ledger = EvidenceLedger()
+        entities = [
+            Entity(name="calculate_tax", query="calculate_tax",
+                   description="计算税率", type_hint="FUNCTION"),
+            Entity(name="format_header", query="format_header",
+                   description="格式化头部", type_hint="FUNCTION"),
+        ]
+
+        prelude = orch.run(
+            entities=entities,
+            task="Compare calculate_tax and format_header",
+            ledger=ledger,
+            recommended_count=2,
+        )
+
+        candidate_ids = {c.id for c in prelude.candidates}
+        assert "src/a.py::calculate_tax" in candidate_ids
+        assert "src/b.py::format_header" in candidate_ids
+        assert len(prelude.candidates) >= 2
+
+    def test_duplicate_candidate_keeps_highest_score(self, tmp_path):
+        """同一 id 的候选被两个实体命中时保留最高分。"""
+        graph = _build_graph_with_two_symbols(tmp_path)
+        candidate = Candidate(
+            id="src/a.py::shared_func",
+            name="shared_func", type="FUNCTION",
+            file="src/a.py", score=100.0, sources=["lexical"],
+        )
+        stronger = Candidate(
+            id="src/a.py::shared_func",
+            name="shared_func", type="FUNCTION",
+            file="src/a.py", score=300.0, sources=["exact_symbol"],
+        )
+        stub = _StubGraphTool(graph, {
+            "entity_a": [candidate],
+            "entity_b": [stronger],
+        })
+        orch = MultiEntityOrchestrator(stub)
+        ledger = EvidenceLedger()
+        entities = [
+            Entity(name="A", query="entity_a", description="a", type_hint="FUNCTION"),
+            Entity(name="B", query="entity_b", description="b", type_hint="FUNCTION"),
+        ]
+
+        prelude = orch.run(
+            entities=entities,
+            task="test",
+            ledger=ledger,
+            recommended_count=2,
+        )
+
+        shared = [c for c in prelude.candidates if c.id == "src/a.py::shared_func"]
+        assert len(shared) == 1
+        assert shared[0].score == 300.0
+
+    def test_retrieval_result_includes_candidates(self, tmp_path):
+        """MultiEntityOrchestrator.run 返回的 prelude.candidates 包含正确的 Candidate 列表。"""
+        graph = _build_graph_with_two_symbols(tmp_path)
+        stub = _StubGraphTool(graph, {
+            "format_header": [
+                Candidate(
+                    id="src/b.py::format_header",
+                    name="format_header", type="FUNCTION",
+                    file="src/b.py", score=200.0, sources=["lexical"],
+                ),
+            ],
+        })
+        orch = MultiEntityOrchestrator(stub)
+        ledger = EvidenceLedger()
+
+        prelude = orch.run(
+            entities=[Entity(name="fmt", query="format_header",
+                            description="format", type_hint="FUNCTION")],
+            task="What does format_header do?",
+            ledger=ledger,
+            recommended_count=1,
+        )
+
+        assert len(prelude.candidates) == 1
+        c = prelude.candidates[0]
+        assert isinstance(c, Candidate)
+        assert c.id == "src/b.py::format_header"
+        assert "lexical" in prelude.stages_attempted
+        assert "lexical" in prelude.stages_succeeded
