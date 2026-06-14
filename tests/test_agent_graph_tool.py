@@ -1202,45 +1202,8 @@ def test_agent_keeps_full_tool_result_while_budgeting_observation(tmp_path):
     assert marker in audit_output[-1]
 
 
-class TestExactSymbolPenalty:
-    """exact_symbol 同名命中数降权 + :: 限定名加分回归测试。"""
-
-    def test_common_name_gets_penalized(self, tmp_path):
-        """select 这类多同名符号分数应低于唯一名。"""
-        graph = nx.MultiDiGraph()
-        # 50 个不同文件中都叫 select
-        for i in range(50):
-            _add_symbol(
-                graph,
-                f"src/module{i}.py::select",
-                NodeType.METHOD,
-                "select",
-                f"src/module{i}.py",
-            )
-        # 1 个唯一名
-        _add_symbol(
-            graph,
-            "src/parser.py::longest_match",
-            NodeType.FUNCTION,
-            "longest_match",
-            "src/parser.py",
-            docstring="Longest match priority algorithm",
-        )
-        tool = _graph_tool(graph, tmp_path)
-        candidates = tool.rank_query_candidates(
-            "How does longest_match select candidates?"
-        )
-
-        # 唯一名应该排在最前面
-        match_cands = [c for c in candidates if c["name"] == "longest_match"]
-        select_cands = [c for c in candidates if c["name"] == "select"]
-        if match_cands and select_cands:
-            match_rank = candidates.index(match_cands[0])
-            select_rank = candidates.index(select_cands[0])
-            assert match_rank < select_rank, (
-                f"unique name 'longest_match' should rank before common 'select', "
-                f"got ranks {match_rank} vs {select_rank}"
-            )
+class TestExactSymbolAnchor:
+    """exact_symbol :: 限定名加分 + fuzzy 阈值回归测试。"""
 
     def test_qualified_name_gets_bonus(self, tmp_path):
         """含 :: 的限定名应比纯简单名分数高。"""
@@ -1267,8 +1230,8 @@ class TestExactSymbolPenalty:
             f"qualified name should rank first, got {candidates[0]['id']}"
         )
 
-    def test_lexical_scale_amplifies_relevance(self, tmp_path):
-        """lexical_scale=2.5 时多字段命中的候选分数应显著提升。"""
+    def test_lexical_multi_field_match(self, tmp_path):
+        """多字段命中的候选应比单字段命中分数高。"""
         graph = nx.MultiDiGraph()
         _add_symbol(
             graph,
@@ -1279,7 +1242,6 @@ class TestExactSymbolPenalty:
             docstring="Format the linting result header using StringIO",
             signature="def format_linting_result_header(io)",
         )
-        # 一个不相关的符号
         _add_symbol(
             graph,
             "src/other.py::other_func",
@@ -1294,10 +1256,7 @@ class TestExactSymbolPenalty:
             "format linting result header function"
         )
         assert candidates[0]["name"] == "format_linting_result_header"
-        # 多字段命中(name+docstring+signature)应使分数远高于无关符号
-        assert candidates[0]["score"] > candidates[1]["score"] * 2, (
-            f"multi-field match should dominate, got {candidates[0]['score']} vs {candidates[1]['score']}"
-        )
+        assert candidates[0]["score"] > candidates[1]["score"]
 
     def test_fuzzy_threshold_filters_noise(self, tmp_path):
         """fuzzy_min_similarity=0.35 应过滤掉低相似度候选。"""

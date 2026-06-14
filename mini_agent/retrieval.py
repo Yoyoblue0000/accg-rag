@@ -344,24 +344,11 @@ class CandidateRetriever:
                 )
         if exact_symbol:
             succeeded.append("exact_symbol")
-            # 统计每个 name 在全图中的命中总数（同名符号数）
-            symbol_hit_counts: dict[str, int] = {}
             for entry in exact_symbol:
-                name_key = entry.name.casefold()
-                total_hits = len(self._by_name.get(name_key, []))
-                symbol_hit_counts[name_key] = total_hits
-
-            for entry in exact_symbol:
-                hit_count = symbol_hit_counts.get(entry.name.casefold(), 1)
                 multiplier = 1.0
-                # 同名符号过多时温和降权：1/(1+0.5×log2(hit_count/threshold))
-                if hit_count > cfg.exact_symbol_hit_count_threshold:
-                    multiplier = 1.0 / (1.0 + 0.5 * math.log2(
-                        hit_count / cfg.exact_symbol_hit_count_threshold
-                    ))
                 # 含 :: 的限定名说明定位更精确，额外加分
                 if "::" in entry.id:
-                    multiplier *= 1.5
+                    multiplier = 1.5
                 self._merge(
                     merged,
                     entry,
