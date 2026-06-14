@@ -742,7 +742,7 @@ class GraphTool:
         if self._candidate_retriever is None:
             summaries = self._load_summary_index()
             self._candidate_retriever = CandidateRetriever(
-                build_entries(self._graph, summaries)
+                build_entries(self._graph, summaries, str(self.project_path))
             )
 
         embedding_candidates = None
