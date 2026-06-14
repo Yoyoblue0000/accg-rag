@@ -361,9 +361,17 @@ class Agent:
         # EntityExtractor 提取出的优化搜索词——优先使用
         entity_search_text = task
         if entities:
-            entity_search_text = entities[0].query or task
-            if len(entities) > 1:
-                entity_search_text = " ".join(e.query or e.name for e in entities)
+            clean_queries = []
+            for e in entities:
+                q = e.query or e.name
+                tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_.]*", q)
+                if tokens:
+                    clean_queries.append(" ".join(tokens))
+                else:
+                    clean_queries.append(e.name)
+            entity_search_text = " ".join(clean_queries)
+            if len(entities) <= 1:
+                entity_search_text = clean_queries[0]
 
         if len(entities) > 1 and self._orchestrator:
             prelude_result = self._orchestrator.run(

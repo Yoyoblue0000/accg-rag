@@ -23,13 +23,15 @@ class MultiEntityConfig:
 
 
 _EXTRACTION_PROMPT = """\
-你是一个代码实体分解器。给定一个关于代码库的问题，识别出需要定位的独立代码实体（函数、类、方法、模块或概念）。
+你是一个代码实体分解器。给定一个关于代码库的问题，识别出需要定位的独立代码符号（函数、类、方法、模块）。
 
 对每个实体输出：
-- name: 简短标签（实体名）
-- query: 优化的搜索关键词（不是自然语言，使用实体的名称和关键标识符）
+- name: 代码中实际存在的符号名（如 Linter、parse、BaseGrammar），不要编造新名称
+- query: 空格分隔的搜索关键词（使用符号名、方法名、关键标识符，不用自然语言句子）
 - description: 这个实体是什么/做什么（一句话）
 - type_hint: FUNCTION, CLASS, METHOD, MODULE, 或 CONCEPT
+
+如果无法确定符号名，用 CONCEPT 类型并填描述性名称。
 
 输出纯 JSON 数组，不要其他文字。
 
@@ -235,7 +237,8 @@ class MultiEntityOrchestrator:
             1, recommended_count // max(len(entities), 1)
         )
 
-        all_stages: set[str] = set()
+        all_attempted: set[str] = set()
+        all_succeeded: set[str] = set()
         for entity in entities:
             entity_section = self._process_entity(
                 entity=entity,
@@ -243,8 +246,10 @@ class MultiEntityOrchestrator:
                 ledger=ledger,
                 max_anchors=max(1, per_entity_budget),
             )
-            all_stages.update(entity_section.get("stages_attempted", []))
-            all_stages.update(entity_section.get("stages_succeeded", []))
+            for stage in entity_section.get("stages_attempted", []):
+                all_attempted.add(stage)
+            for stage in entity_section.get("stages_succeeded", []):
+                all_succeeded.add(stage)
             self._merge_entity_result(entity, entity_section, prelude)
 
         # 按 id 合并各实体候选，重复候选保留最高分
@@ -264,8 +269,8 @@ class MultiEntityOrchestrator:
             )
             for c in merged.values()
         ]
-        prelude.stages_attempted = sorted(all_stages)
-        prelude.stages_succeeded = sorted(all_stages)
+        prelude.stages_attempted = sorted(all_attempted)
+        prelude.stages_succeeded = sorted(all_succeeded)
 
         if prelude.anchor_count == 0:
             prelude.diagnostics.append("所有实体均未通过锚点验证")
