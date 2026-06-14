@@ -7,14 +7,17 @@ import re
 import time
 from pathlib import Path
 
-from accg.models import NodeId, EdgeType
+from accg.models import EdgeType, NodeId
+
 from .retrieval import (
     Candidate,
     CandidateRetriever,
     RetrievalResult,
     build_entries,
-    select_query_anchors as _select_query_anchors,
     tokenize,
+)
+from .retrieval import (
+    select_query_anchors as _select_query_anchors,
 )
 
 logger = logging.getLogger("mini_agent.graph_tool")
@@ -841,6 +844,7 @@ class GraphTool:
                 for _, node_type in sorted(explicit_type_positions)
             ],
             prefer_term_coverage=comparison_query,
+            query_terms=query_terms,
         ):
             item = candidate.to_dict()
             if "exact_id" in candidate.sources:

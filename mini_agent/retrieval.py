@@ -604,20 +604,37 @@ def select_query_anchors(
     preferred_types: list[str] | None = None,
     required_types: list[str] | None = None,
     prefer_term_coverage: bool = False,
+    query_terms: set[str] | None = None,
 ) -> list[Candidate]:
-    """优先覆盖函数与类，再按原始排名补足。"""
+    """优先覆盖函数与类，按名去重，考虑候选名与 query 的 token 重叠。"""
     if max_anchors <= 0:
         return []
 
     selected: list[Candidate] = []
     selected_ids: set[str] = set()
+    selected_names: set[str] = set()  # 同名去重
+    query_terms = query_terms or set()
 
     def _add(candidate: Candidate) -> bool:
         if candidate.id in selected_ids:
             return False
+        if candidate.name.casefold() in selected_names:
+            return False
         selected.append(candidate)
         selected_ids.add(candidate.id)
+        selected_names.add(candidate.name.casefold())
         return len(selected) >= max_anchors
+
+    def _name_relevance(candidate: Candidate) -> float:
+        """候选名 token 与 query token 的重叠度，:: 限定名加分。"""
+        name_tokens = set(tokenize(candidate.name))
+        if not name_tokens or not query_terms:
+            return 0.0
+        overlap = name_tokens & query_terms
+        score = len(overlap) / len(name_tokens)
+        if "::" in candidate.id:
+            score *= 1.5
+        return score
 
     for candidate in candidates:
         if "exact_id" in candidate.sources and _add(candidate):
@@ -699,7 +716,7 @@ def select_query_anchors(
         if len(selected) >= max_anchors:
             return selected
 
-    # 剩余候补：分数驱动，类型仅做平局打破
+    # 剩余候补：分数 + query 重叠度 + 类型平局打破
     type_rank = (
         {t: i for i, t in enumerate(preferred_types)}
         if preferred_types
@@ -709,10 +726,12 @@ def select_query_anchors(
         candidate
         for candidate in candidates
         if candidate.id not in selected_ids
+        and candidate.name.casefold() not in selected_names
     ]
     remaining.sort(
         key=lambda c: (
             -c.score,
+            -_name_relevance(c),
             type_rank.get(c.type, len(type_rank)),
             candidates.index(c),
         )
