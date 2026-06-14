@@ -354,7 +354,7 @@ class Agent:
         entities = []
         use_multi_entity = False
         if self._orchestrator and self.graph_tool:
-            entities = self._entity_extractor.extract(task)
+            entities = self._entity_extractor.extract(task, max_entities=4)
             query_plan.entities = [e.to_dict() for e in entities]
             use_multi_entity = len(entities) > 1
 

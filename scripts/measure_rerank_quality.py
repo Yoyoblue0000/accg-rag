@@ -48,7 +48,7 @@ for i, q in enumerate(qa):
 
     # 重排
     rr = reranker.rerank(question, candidates)
-    reranked = reranker.apply(question, candidates) if rr.passed else candidates
+    reranked = reranker.apply(question, candidates, rerank_result=rr) if rr.passed else candidates
 
     # 记录每个 gold 实体在重排后的排名
     gold_ranks_after = {}

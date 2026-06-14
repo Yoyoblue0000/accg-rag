@@ -36,7 +36,7 @@ for i, q in enumerate(qa):
     # 有重排锚点
     rerank_result = reranker.rerank(question, candidates)
     if rerank_result.passed:
-        reranked = reranker.apply(question, candidates)
+        reranked = reranker.apply(question, candidates, rerank_result=rerank_result)
         anchors_rerank = gt.select_query_anchors(question, reranked, max_anchors=3)
         rerank_matches = sum(1 for a in anchors_rerank if _matched_gold(a, gold))
     else:

@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""多实体并行检索编排 —— 实体提取 + 每实体独立检索+选锚点+预取。"""
+"""多实体独立检索编排 —— 实体提取 + 每实体独立检索+选锚点+预取。
+
+重排策略：合并候选后统一重排。每实体独立检索不做重排。
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,14 @@ from dataclasses import dataclass, field
 
 from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
 from .retrieval import Candidate, RetrievalResult
+
+
+@dataclass
+class MultiEntityConfig:
+    """多实体检索配置。"""
+    max_entities: int = 4
+    candidate_limit: int = 12
+    candidate_display_limit: int = 6
 
 
 _EXTRACTION_PROMPT = """\
@@ -62,7 +73,7 @@ class EntityExtractor:
     def __init__(self, model=None):
         self._model = model
 
-    def extract(self, question: str) -> list[Entity]:
+    def extract(self, question: str, max_entities: int = 4) -> list[Entity]:
         if self._model is None:
             return [Entity(name="primary", query=question)]
 
@@ -75,7 +86,23 @@ class EntityExtractor:
         entities = self._parse(raw)
         if not entities:
             return [Entity(name="primary", query=question)]
-        return entities
+
+        # 删除空名称、按 name.casefold() 去重、限制数量
+        seen: set[str] = set()
+        filtered: list[Entity] = []
+        for e in entities:
+            if not e.name.strip():
+                continue
+            key = e.name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(e)
+            if len(filtered) >= max_entities:
+                break
+        if not filtered:
+            return [Entity(name="primary", query=question)]
+        return filtered
 
     @staticmethod
     def _parse(raw: str) -> list[Entity]:
@@ -186,12 +213,14 @@ class MultiEntityPrelude:
 
 
 class MultiEntityOrchestrator:
-    """对每个实体独立检索、选锚点、预取，合并为一个 prelude。"""
+    """对每个实体独立检索、选锚点、预取，合并为一个 prelude。
 
-    CANDIDATE_DISPLAY_LIMIT = 6
+    重排策略：各实体独立检索不做重排；合并候选后，由上层 Agent 统一执行在线重排。
+    """
 
-    def __init__(self, graph_tool):
+    def __init__(self, graph_tool, config: MultiEntityConfig | None = None):
         self.graph_tool = graph_tool
+        self._config = config or MultiEntityConfig()
 
     def run(
         self,
@@ -266,8 +295,10 @@ class MultiEntityOrchestrator:
         try:
             retrieval = self.graph_tool.search(
                 entity.query,
-                limit=12,
-                use_embeddings=False,
+                limit=self._config.candidate_limit,
+                use_embeddings=(
+                    getattr(self.graph_tool, "enable_embeddings", False)
+                ),
             )
         except Exception as e:
             result["diagnostics"].append(
@@ -291,7 +322,7 @@ class MultiEntityOrchestrator:
 
         # 2. 候选展示
         display_items = []
-        for c in candidates[:self.CANDIDATE_DISPLAY_LIMIT]:
+        for c in candidates[:self._config.candidate_display_limit]:
             sources = ",".join(c.get("sources", []))
             display_items.append(
                 f"  - {c['name']} ({c['type']}) {c['id']} "
