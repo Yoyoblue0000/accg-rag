@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """对比不同大小模型生成摘要的质量与速度。"""
 
-import json, random, statistics, time
+import json
+import random
+import statistics
+import time
 from pathlib import Path
 
 from mini_agent.model import Model, ModelConfig
@@ -20,7 +23,6 @@ One-sentence summary:"""
 
 def collect_functions(project_path: str, n: int) -> list[dict]:
     """随机采样 n 个函数。"""
-    from mini_agent.graph_tool import GraphTool
     gt = GraphTool(project_path, enable_embeddings=False)
     gt.ensure_built()
     root = Path(project_path).resolve()

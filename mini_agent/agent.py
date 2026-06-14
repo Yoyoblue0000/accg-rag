@@ -17,7 +17,7 @@ from .sufficiency import (
     GateDecision,
     SufficiencyGate,
 )
-from .multi_entity import Entity, EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
+from .multi_entity import EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
 from .narrator import narrate
 from accg.models import NodeId
 

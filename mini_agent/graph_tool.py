@@ -619,13 +619,12 @@ class GraphTool:
     def _attach_class_details(self, nid: str, entry: dict):
         """给 CLASS 节点附加：方法列表 + 实例化关系（含通过子类的间接实例化）"""
         methods = []
-        init_id = None
         for _, v, d in self._graph.out_edges(nid, data=True):
             if d.get("edge_type") == EdgeType.CONTAINS:
                 m_name = self._graph.nodes[v].get("name", v)
                 methods.append({"id": v, "name": m_name})
                 if m_name == "__init__":
-                    init_id = v
+                    pass
 
         if methods:
             summaries = self._load_summary_index()

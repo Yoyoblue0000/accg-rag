@@ -102,7 +102,7 @@ def _evaluate_answer_quality(judge_model, question: str, expected: str, actual: 
 def _print_silent(run_index: int, total: int, qa: dict, result: RunResult,
                   *, retrieval_only: bool = False):
     """静默层：每题一行"""
-    q = qa["question"][:80]
+    qa["question"][:80]
     selected_anchors = (
         result.query_plan.get("anchors", [])
         if result.query_plan
@@ -157,7 +157,7 @@ def _print_verbose_step(m: MsgRecord) -> None:
     elif m.role == "user":
         content = m.content.replace("[候选符号] 以下与问题语义最相关:", "\n  [候选锚点]")
         print(f"\n{'─'*60}")
-        print(f"[Init] 用户问题 + 候选锚点")
+        print("[Init] 用户问题 + 候选锚点")
         print(f"{'─'*60}")
         print(content)
     elif m.role == "assistant":
@@ -177,7 +177,7 @@ def _print_verbose2_step(m: MsgRecord) -> None:
         return
     elif m.role == "user":
         print(f"\n{'─'*60}")
-        print(f"[Init] user")
+        print("[Init] user")
         print(f"{'─'*60}")
         print(m.content)
     elif m.role == "assistant":
@@ -641,7 +641,7 @@ def main():
 
     # ── 门禁判定 ──
     print(f"\n{'='*60}")
-    print(f"发布门禁")
+    print("发布门禁")
     print(f"{'='*60}")
     print(f"完成: {completed_count} 题  失败: {failed_count} 题  (共 {total_run} 题)")
     if judge_evaluable > 0:

@@ -10,10 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mini_agent.graph_tool import GraphTool
-from mini_agent.retrieval import Candidate, CandidateRetriever
 from mini_agent.retrieval_metrics import (
     GoldLocations,
-    _candidate_value,
     _matched_gold,
     _normalize_path,
     _normalize_symbol,
@@ -202,13 +200,13 @@ def print_diagnosis(diag: AnchorDiagnosis, verbosity: int = 0) -> None:
     print(f"问题: {diag.question}...")
 
     if diag.gold.count > 0:
-        print(f"\n── Gold（从参考答案提取）──")
+        print("\n── Gold（从参考答案提取）──")
         if diag.gold.paths:
             print(f"  路径: {diag.gold.paths}")
         if diag.gold.symbols:
             print(f"  符号: {diag.gold.symbols}")
     else:
-        print(f"\n── Gold ── 无（参考答案无法提取结构化实体）")
+        print("\n── Gold ── 无（参考答案无法提取结构化实体）")
 
     print(f"\n── 选中锚点 ({len(diag.selected_anchors)}) ──")
     for a in diag.selected_anchors:
@@ -229,7 +227,7 @@ def print_diagnosis(diag: AnchorDiagnosis, verbosity: int = 0) -> None:
                 print(f"  {_candidate_label(c)}")
 
     if diag.missed_gold_paths or diag.missed_gold_symbols:
-        print(f"\n── 错失的 Gold 实体 ──")
+        print("\n── 错失的 Gold 实体 ──")
         for p in diag.missed_gold_paths:
             ranks = _find_gold_in_candidates(p, diag.candidates, "path")
             print(f"  路径: {p}  → 候选排名: {ranks if ranks else '未进入候选列表'}")
@@ -266,7 +264,7 @@ def print_summary(diagnoses: list[AnchorDiagnosis]) -> dict:
     print(f"锚点选择分析汇总（{total} 题）")
     print(f"{'='*70}")
 
-    print(f"\n── 根因分布 ──")
+    print("\n── 根因分布 ──")
     for cause, count in cause_counter.most_common():
         pct = count / total * 100
         print(f"  {cause}: {count} ({pct:.0f}%)")
@@ -315,7 +313,7 @@ def print_summary(diagnoses: list[AnchorDiagnosis]) -> dict:
         for a in d.selected_anchors:
             for src in a.get("sources", []):
                 stage_contributions[src] += 1
-    print(f"\n── 锚点来源阶段分布 ──")
+    print("\n── 锚点来源阶段分布 ──")
     for stage in ["exact_id", "exact_symbol", "lexical", "embedding", "fuzzy"]:
         count = stage_contributions.get(stage, 0)
         pct = count / max(sum(stage_contributions.values()), 1) * 100
@@ -375,7 +373,7 @@ def main():
     proj_path = Path(args.project_path).expanduser().resolve()
     print(f"项目: {proj_path}")
     print(f"QA: {qa_path} ({len(indices)}/{total_available} 题)")
-    print(f"初始化图工具...")
+    print("初始化图工具...")
 
     gt = GraphTool(str(proj_path), enable_embeddings=False)
     print(gt.ensure_built())

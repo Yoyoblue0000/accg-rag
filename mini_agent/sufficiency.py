@@ -861,7 +861,7 @@ class SufficiencyGate:
                 scope_parts = []
                 if anchors:
                     scope_parts.append(f"查询目标: {', '.join(a.get('id','') for a in anchors[:2])}")
-                scope_parts.append(f"边类型: CALLS, INHERITS, INSTANTIATED_BY")
+                scope_parts.append("边类型: CALLS, INHERITS, INSTANTIATED_BY")
                 scope_parts.append(f"搜索深度: ≤{self._gate_config.expansion_max_depth}")
                 scope_parts.append(f"置信度阈值: ≥{self._gate_config.min_confidence}")
                 if expanded_relations:

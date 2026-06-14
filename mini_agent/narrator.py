@@ -19,7 +19,7 @@ def narrate_contextualize(data: dict, args: dict) -> str:
     lines.append(f"[contextualize] {query} -- {'精确匹配' if exact else f'找到{len(results)}个结果'}")
 
     for i, r in enumerate(results[:3]):
-        nid = r.get("id", "")
+        r.get("id", "")
         nt = r.get("type", "")
         f = r.get("file", "")
         sl = r.get("start_line", 0)
@@ -189,7 +189,7 @@ def narrate_module(data, args) -> str:
     for m in items[:15]:
         lines.append(f"  {m.get('name','')} ({m.get('type','')})")
     if total > 15:
-        lines.append(f"  ...已截断")
+        lines.append("  ...已截断")
     return "\n".join(lines)
 
 

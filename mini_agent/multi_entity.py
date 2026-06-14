@@ -10,8 +10,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
-from .retrieval import Candidate, RetrievalResult
+from .evidence import EvidenceItem, EvidenceLedger
+from .retrieval import Candidate
 
 
 @dataclass

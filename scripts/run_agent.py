@@ -73,7 +73,7 @@ def main():
 
     # 上下文审计回调
     context_dumps = []
-    context_log_path = Path(project_path) / "context_log.txt"
+    context_log_path = Path.cwd() / "context_log.txt"
     if verbose:
         context_log_path.write_text("", encoding="utf-8")  # 每次运行清空
 
@@ -138,7 +138,7 @@ def main():
     result = agent.run(task)
 
     if dump_context and context_dumps:
-        dump_path = Path(project_path) / "context_dump.json"
+        dump_path = Path.cwd() / "context_dump.json"
         dump_data = {
             "task": task,
             "model": model_name,
@@ -155,7 +155,7 @@ def main():
 
     if result.error:
         print(f"\n[错误] {result.error}")
-        return
+        sys.exit(1)
     if result.synthesis:
         print(f"\n{'─'*40}\n[合成答案]\n{'─'*40}")
         print(result.synthesis.answer)

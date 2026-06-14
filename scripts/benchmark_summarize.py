@@ -137,7 +137,7 @@ def main():
                         help="不做采样，跑全量")
     args = parser.parse_args()
 
-    print(f"提取函数列表...")
+    print("提取函数列表...")
     all_funcs = extract_functions(args.project_path)
     print(f"共 {len(all_funcs)} 个函数/方法")
 

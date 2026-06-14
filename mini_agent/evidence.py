@@ -499,7 +499,7 @@ class EvidenceItem:
         results = data.get("results", [])
         for i, r in enumerate(results):
             nid = r.get("id", "")
-            nt = r.get("type", "")
+            r.get("type", "")
             f = r.get("file", "")
             sl = r.get("start_line", 0)
             el = r.get("end_line", 0)

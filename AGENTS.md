@@ -20,9 +20,14 @@ scripts/
   run_qa.py       — QA 批量评估入口（支持 --json、--id、即时写入）
   analyze_candidates.py — embedding 候选相关性分析
 tests/
-  test_agent_model.py      — model 层解析测试（40 条）
-  test_agent_graph_tool.py — 候选排序与预取测试
-  test_sufficiency.py      — P4 完成语义、门控与扩展测试
+  test_agent_model.py      — model 层解析测试
+  test_agent_graph_tool.py — 候选排序、锚点选择、预取、扩展、合成测试
+  test_agent_evidence.py   — 证据账本与渲染测试
+  test_sufficiency.py      — 门控通过/拒绝、实体过滤、否定语义测试
+  test_multi_entity.py     — 多实体检索候选记录测试
+  test_entity_extraction.py — 实体提取与去重测试
+  test_query_plan.py       — 查询计划与锚点选择测试
+  test_retrieval_metrics.py — 检索指标评估测试
 ```
 
 ## 常用命令
@@ -41,7 +46,12 @@ uv venv && uv pip install -e .
   --model qwen2.5-coder:14b-instruct --limit 20
 
 # 运行 Agent 测试
-.venv/Scripts/python.exe -m pytest tests/test_agent_model.py -v
+.venv/Scripts/python.exe -m pytest tests -v
+
+# 代码质量
+.venv/Scripts/python.exe -m ruff check mini_agent/ scripts/ --select E,F --ignore E501
+.venv/Scripts/python.exe -m compileall -q mini_agent scripts
+uv pip check
 ```
 
 ## 协议

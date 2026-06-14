@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from mini_agent.graph_tool import GraphTool, EmbeddingRanker, _split_camel, _build_embed_text
+from mini_agent.graph_tool import GraphTool, EmbeddingRanker, _split_camel
 
 
 def analyze(project_path: str, qa_path: str, limit: int = 10):
@@ -59,7 +59,7 @@ def analyze(project_path: str, qa_path: str, limit: int = 10):
         # 运行 embedding 排名
         candidates = gt.embedding_ranker.rank(q, limit=10)
 
-        print(f"\nTop-10 Embedding 候选:")
+        print("\nTop-10 Embedding 候选:")
         print(f"{'排名':<5} {'相似度':<8} {'类型':<10} {'名称':<45} {'文件':<50}")
         print(f"{'─'*120}")
 
@@ -88,7 +88,7 @@ def analyze(project_path: str, qa_path: str, limit: int = 10):
 
         # 简要分析
         top1 = candidates[0]
-        print(f"\n  简要评估:")
+        print("\n  简要评估:")
         print(f"    Top-1: {top1['name']} ({top1['type']}, sim={top1['score']:.4f})")
 
         # 从问题中提取关键短语，看看 top1 名字是否相关

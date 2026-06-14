@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .model import Model
@@ -51,7 +51,7 @@ def _build_candidate_digest(index: int, c: dict, root: Path) -> str:
     """为单个候选构建简洁的信号摘要。"""
     name = c.get("name", "?")
     ctype = c.get("type", "?")
-    fid = c.get("id", "?")
+    c.get("id", "?")
     file_path = str(c.get("file", ""))
     signature = str(c.get("signature", ""))[:200]
 
@@ -200,12 +200,14 @@ class Reranker:
 
         return indices, reasoning
 
-    def apply(self, question: str, candidates: list[dict]) -> list[dict]:
+    def apply(self, question: str, candidates: list[dict],
+              rerank_result: RerankResult | None = None) -> list[dict]:
         """便捷方法：重排并返回重排后的候选列表。
 
         保持原始候选结构，将相关候选提到前面，截断不相关的。
+        可传入预计算的 rerank_result 避免重复推理。
         """
-        result = self.rerank(question, candidates)
+        result = rerank_result if rerank_result is not None else self.rerank(question, candidates)
         if not result.passed:
             return list(candidates)[:self.MAX_OUTPUT]
 

@@ -46,5 +46,11 @@ Thumbs.db
 sqlfluff_*
 test_repos/sqlfluff_*
 
+# 临时产物
+.pytest-tmp*/
+*.tar.gz
+1.md
+context_log.txt
+context_dump.json
 
 handoff/

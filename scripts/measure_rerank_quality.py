@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """直接测重排排序质量：gold 实体在重排前后排名变化。"""
 
-import json, statistics
+import json
+import statistics
 from pathlib import Path
 
 from mini_agent.graph_tool import GraphTool
 from mini_agent.model import Model, ModelConfig
 from mini_agent.reranker import Reranker
 from mini_agent.retrieval_metrics import (
-    _matched_gold, _normalize_symbol, extract_provisional_gold,
+    _normalize_symbol, extract_provisional_gold,
 )
 
 qa = json.loads(Path("/home/amd-jk6kg8k/program/sqlfluff_qa.json").read_text())

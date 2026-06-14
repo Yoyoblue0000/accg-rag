@@ -9,8 +9,26 @@ dependencies = [
     "openai>=1.0",
 ]
 
-[project.optional-dependencies]
-dev = ["pytest>=8.0"]
+[tool.setuptools.packages.find]
+include = ["mini_agent*"]
 
-[tool.uv]
-dev-dependencies = ["pytest>=8.0"]
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
