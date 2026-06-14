@@ -304,7 +304,8 @@ class CandidateRetriever:
         self._by_qualified_name: dict[str, list[_Entry]] = {}
         self._phrase_entries: dict[str, list[_Entry]] = {}
         self._document_frequency: Counter[str] = Counter()
-        self._weighted_documents: dict[str, Counter[str]] = {}
+        self._term_frequency: dict[str, Counter[str]] = {}
+        self._term_boost: dict[str, Counter[str]] = {}
         self._document_lengths: dict[str, float] = {}
         for entry in entries:
             self._by_name.setdefault(entry.name.casefold(), []).append(entry)
@@ -322,15 +323,18 @@ class CandidateRetriever:
                         [],
                     ).append(entry)
 
-            weighted = Counter()
+            tf = Counter()
+            boost_acc = Counter()
             seen = set()
             for field_name, tokens in entry.fields.items():
                 boost = self._config.field_boosts[field_name]
                 for token in tokens:
-                    weighted[token] += boost
+                    tf[token] += 1
+                    boost_acc[token] += boost
                     seen.add(token)
-            self._weighted_documents[entry.id] = weighted
-            self._document_lengths[entry.id] = sum(weighted.values())
+            self._term_frequency[entry.id] = tf
+            self._term_boost[entry.id] = boost_acc
+            self._document_lengths[entry.id] = sum(tf.values())
             self._document_frequency.update(seen)
         self._average_document_length = (
             sum(self._document_lengths.values()) / len(self._document_lengths)
@@ -508,32 +512,35 @@ class CandidateRetriever:
         total_documents = len(self.entries)
         ranked = []
         for entry in self.entries:
-            weighted = self._weighted_documents[entry.id]
-            length = self._document_lengths[entry.id]
+            tf_map = self._term_frequency[entry.id]
+            boost_map = self._term_boost[entry.id]
+            doc_len = self._document_lengths[entry.id]
             score = 0.0
             matched_terms = []
             matched_fields = set()
             for term in query_terms:
-                frequency = weighted.get(term, 0.0)
-                if not frequency:
+                tf = tf_map.get(term, 0)
+                if not tf:
                     continue
                 matched_terms.append(term)
                 for field_name, tokens in entry.fields.items():
                     if term in tokens:
                         matched_fields.add(field_name)
+                boost_acc = boost_map.get(term, 0)
+                boost_factor = boost_acc / max(tf, 1)
                 idf = math.log(
                     1.0 + (
                         total_documents - self._document_frequency[term] + 0.5
                     ) / (self._document_frequency[term] + 0.5)
                 )
-                denominator = frequency + 1.5 * (
+                denominator = tf + 1.5 * (
                     1.0 - 0.75
-                    + 0.75 * length / max(
+                    + 0.75 * doc_len / max(
                         self._average_document_length,
                         1.0,
                     )
                 )
-                score += idf * frequency * 2.5 / denominator
+                score += idf * tf * 2.5 * boost_factor / denominator
 
             if score:
                 score *= _category_multiplier(entry, query, self._config)
