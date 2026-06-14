@@ -18,6 +18,13 @@ class DisplayLevel(enum.Enum):
     FOLD = "fold"           # 仅实体身份、类型和来源
 
 
+def has_valid_source_context(value: object) -> bool:
+    """检查 source_context 是否为有效源码（非空、非错误占位符）。"""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    return not value.lstrip().startswith(("[无法读取", "[错误]"))
+
+
 # 源码实体的关键字段
 _SOURCE_KEY_FIELDS = {
     "id", "name", "type", "file", "start_line", "end_line",
@@ -497,12 +504,13 @@ class EvidenceItem:
             sl = r.get("start_line", 0)
             el = r.get("end_line", 0)
 
-            # 源码证据
+            # 源码证据 — complete 取决于 source_context 是否有效
+            has_source = has_valid_source_context(r.get("source_context"))
             items.append(cls(
                 evidence_id=f"{eid_prefix}-src-{i}",
                 kind="source", source="query_graph",
                 node_id=nid, file=f, start_line=sl, end_line=el,
-                payload=r, complete=True,
+                payload=r, complete=has_source,
                 tool_name="query_graph", tool_args=args, step=step,
             ))
 

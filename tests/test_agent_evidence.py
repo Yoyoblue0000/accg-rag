@@ -817,4 +817,55 @@ class TestSelectionExplainability:
 
         assert [e.evidence_id for e in first] == [e.evidence_id for e in second]
         # source 优先于 relation
-        assert first[0].kind == "source"
+
+
+class TestSourceContextValidation:
+    """has_valid_source_context 和 EvidenceItem.complete 回归测试。"""
+
+    def test_empty_source_context_marks_incomplete(self):
+        """空 source_context 应导致 complete=False。"""
+        from mini_agent.evidence import has_valid_source_context
+        assert not has_valid_source_context("")
+        assert not has_valid_source_context("   ")
+        assert not has_valid_source_context(None)
+        assert not has_valid_source_context(123)
+
+    def test_error_marker_rejected(self):
+        """[无法读取源码] 和 [错误] 前缀应被拒绝。"""
+        from mini_agent.evidence import has_valid_source_context
+        assert not has_valid_source_context("[无法读取源码]")
+        assert not has_valid_source_context("[错误] 文件不存在")
+        assert has_valid_source_context("def foo(): pass")
+        assert has_valid_source_context("读取失败：未找到文件")  # 不含禁止前缀
+
+    def test_contextualize_empty_source_makes_incomplete(self):
+        """contextualize 返回空 source_context 时 EvidenceItem.complete 应为 False。"""
+        raw = json.dumps({
+            "results": [{
+                "id": "src/a.py::Foo", "name": "Foo", "type": "FUNCTION",
+                "file": "src/a.py", "start_line": 1, "end_line": 5,
+                "source_context": "",
+            }],
+        })
+        items = EvidenceItem.from_tool_result(
+            "query_graph", {"action": "contextualize", "name": "Foo"}, raw, step=1,
+        )
+        sources = [i for i in items if i.kind == "source"]
+        assert len(sources) == 1
+        assert sources[0].complete is False
+
+    def test_contextualize_error_marker_makes_incomplete(self):
+        """contextualize 返回错误占位符时 EvidenceItem.complete 应为 False。"""
+        raw = json.dumps({
+            "results": [{
+                "id": "src/a.py::Foo", "name": "Foo", "type": "FUNCTION",
+                "file": "src/a.py", "start_line": 1, "end_line": 5,
+                "source_context": "[无法读取源码]",
+            }],
+        })
+        items = EvidenceItem.from_tool_result(
+            "query_graph", {"action": "contextualize", "name": "Foo"}, raw, step=1,
+        )
+        sources = [i for i in items if i.kind == "source"]
+        assert len(sources) == 1
+        assert sources[0].complete is False

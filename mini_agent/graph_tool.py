@@ -3,7 +3,6 @@
 import hashlib
 import json
 import logging
-import pickle
 import re
 import time
 from pathlib import Path
@@ -114,7 +113,7 @@ class EmbeddingRanker:
     def _cache_path(self) -> Path | None:
         if self._cache_dir is None:
             return None
-        return self._cache_dir / f"embeddings_{self._model.replace('/', '_')}.pkl"
+        return self._cache_dir / f"embeddings_{self._model.replace('/', '_')}.json"
 
     def build_index(self, graph, summaries: dict[str, str] | None = None) -> None:
         """预计算全图节点的 embedding（批量），优先从磁盘缓存加载。
@@ -169,14 +168,14 @@ class EmbeddingRanker:
         if not entries:
             return
 
-        # 尝试从缓存加载
+        # 尝试从缓存加载（JSON 格式，安全反序列化）
         cache_path = self._cache_path()
         if cache_path is not None:
             fp = self._fingerprint(entries, summaries)
             try:
-                cached = pickle.loads(cache_path.read_bytes())
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
                 if cached.get("version") == self._CACHE_VERSION and cached.get("fingerprint") == fp:
-                    self._embeddings = cached["embeddings"]
+                    self._embeddings = [(entry, vec) for entry, vec in cached["embeddings"]]
                     logger.info("EmbeddingRanker: 从缓存加载 %d 个符号 (%s)", len(self._embeddings), cache_path)
                     return
             except Exception:
@@ -198,15 +197,15 @@ class EmbeddingRanker:
         self._embeddings = list(zip(entries, all_vecs))
         logger.info("EmbeddingRanker: 已索引 %d 个符号", len(entries))
 
-        # 写入缓存
+        # 写入缓存（JSON 格式）
         if cache_path is not None:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_bytes(pickle.dumps({
+                cache_path.write_text(json.dumps({
                     "version": self._CACHE_VERSION,
                     "fingerprint": fp,
-                    "embeddings": self._embeddings,
-                }))
+                    "embeddings": [(entry, vec) for entry, vec in self._embeddings],
+                }, ensure_ascii=False), encoding="utf-8")
                 logger.info("EmbeddingRanker: 已写入缓存 %s", cache_path)
             except Exception:
                 pass
@@ -576,10 +575,12 @@ class GraphTool:
                 "docstring": info.get("docstring", ""),
             }
 
-            # 源码：只取函数体（start_line 到 end_line）
-            if file_path and start_line:
+            # 源码：只取函数体（start_line 到 end_line），项目根目录约束
+            if file_path and start_line and start_line > 0 and end_line >= start_line:
                 try:
-                    full_path = self.project_path / file_path
+                    root = self.project_path.resolve()
+                    full_path = (root / file_path).resolve()
+                    full_path.relative_to(root)
                     if full_path.exists():
                         lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
                         body_start = max(0, start_line - 1)
@@ -588,8 +589,14 @@ class GraphTool:
                             f"{i+1:4d}| {line}"
                             for i, line in enumerate(lines[body_start:body_end], start=body_start)
                         )
-                except Exception:
-                    entry["source_context"] = "[无法读取源码]"
+                    else:
+                        entry["source_error"] = f"文件不存在: {file_path}"
+                except ValueError:
+                    entry["source_error"] = f"路径越界: {file_path}"
+                except OSError as exc:
+                    entry["source_error"] = f"无法读取源码: {exc}"
+            elif file_path and not (start_line and start_line > 0 and end_line >= start_line):
+                entry["source_error"] = "无效行号范围"
 
             # 调用关系
             if nt in ("FUNCTION", "METHOD"):

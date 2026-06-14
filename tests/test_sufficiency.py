@@ -911,3 +911,38 @@ def _rel(
 def _anchor(aid, atype="FUNCTION"):
     return {"id": aid, "type": atype, "name": aid.split("::")[-1],
             "validation": {"valid": True}}
+
+
+class TestSourceCompletenessGate:
+    """_is_complete_source 回归测试：空源码/错误占位符/越界路径不能通过。"""
+
+    def test_empty_source_context_not_complete(self):
+        from mini_agent.sufficiency import _is_complete_source
+        item = _FakeItem(
+            "source", node_id="src/a.py::A", file="src/a.py",
+            start_line=1, end_line=10,
+            payload={"type": "FUNCTION", "source_context": ""},
+        )
+        assert not _is_complete_source(item)
+
+    def test_error_marker_not_complete(self):
+        """[无法读取源码] 等错误占位符不应通过。"""
+        from mini_agent.sufficiency import _is_complete_source
+        for bad in ("[无法读取源码]", "[错误] 文件不存在: x.go"):
+            item = _FakeItem(
+                "source", node_id="src/a.py::A", file="src/a.py",
+                start_line=1, end_line=10,
+                payload={"type": "FUNCTION", "source_context": bad},
+            )
+            assert not _is_complete_source(item)
+
+    def test_requires_valid_line_range(self):
+        """start_line <= 0 或 end_line < start_line 不能通过。"""
+        from mini_agent.sufficiency import _is_complete_source
+        for sl, el in ((0, 10), (-1, 5), (10, 5)):
+            item = _FakeItem(
+                "source", node_id="src/a.py::A", file="src/a.py",
+                start_line=sl, end_line=el,
+                payload={"type": "FUNCTION", "source_context": "def foo(): pass"},
+            )
+            assert not _is_complete_source(item), f"line range {sl}-{el} should fail"

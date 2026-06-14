@@ -7,6 +7,8 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 
+from .evidence import has_valid_source_context
+
 
 @dataclass
 class FinishAction:
@@ -222,18 +224,21 @@ def _is_complete_source(item) -> bool:
     payload = getattr(item, "payload", {})
     if not isinstance(payload, dict):
         return False
+
+    start_line = getattr(item, "start_line", None)
+    if start_line is None:
+        start_line = payload.get("start_line")
+    end_line = getattr(item, "end_line", None)
+    if end_line is None:
+        end_line = payload.get("end_line")
+
     return bool(
         getattr(item, "node_id", None)
         and (getattr(item, "file", None) or payload.get("file"))
-        and (
-            getattr(item, "start_line", None) is not None
-            or payload.get("start_line") is not None
-        )
-        and (
-            getattr(item, "end_line", None) is not None
-            or payload.get("end_line") is not None
-        )
+        and isinstance(start_line, (int, float)) and start_line > 0
+        and isinstance(end_line, (int, float)) and end_line >= start_line
         and payload.get("type")
+        and has_valid_source_context(payload.get("source_context"))
     )
 
 
