@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""离线摘要索引构建 — 用 7B 模型对全量函数生成摘要并持久化到 .accg/summary_index.json。
+"""离线摘要索引构建 — 对全量函数、方法和类生成摘要并持久化到 .accg/summary_index.json。
 
 用法:
   .venv/bin/python scripts/build_summary_index.py \
@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-SUMMARY_PROMPT = """You are a code analysis expert. Summarize the purpose of the following function in one sentence (max 50 words). Only output the summary, no explanation, no code.
+FUNC_PROMPT = """You are a code analysis expert. Summarize the purpose of the following function in one sentence (max 50 words). Only output the summary, no explanation, no code.
 
 Signature: {signature}
 Source:
@@ -24,9 +24,20 @@ Source:
 
 One-sentence summary:"""
 
+CLASS_PROMPT = """You are a code analysis expert. Summarize the architectural role of the following class in one sentence (max 50 words). Focus on its responsibility, key methods, and how it interacts with other components. Only output the summary, no explanation, no code.
+
+Class: {name}
+{extra}
+Source:
+```
+{source}
+```
+
+One-sentence summary:"""
+
 
 def _collect_nodes(project_path: str) -> list[dict]:
-    """从图中收集所有 FUNCTION/METHOD 节点及其源码。"""
+    """从图中收集所有 FUNCTION/METHOD/CLASS 节点及其源码。"""
     from mini_agent.graph_tool import GraphTool
     gt = GraphTool(project_path, enable_embeddings=False)
     gt.ensure_built()
@@ -36,7 +47,7 @@ def _collect_nodes(project_path: str) -> list[dict]:
     for nid, data in gt._graph.nodes(data=True):
         nt = data.get("node_type")
         tn = getattr(nt, "name", str(nt or ""))
-        if tn not in ("FUNCTION", "METHOD"):
+        if tn not in ("FUNCTION", "METHOD", "CLASS"):
             continue
         fp = str(data.get("file_path", ""))
         sl = int(data.get("start_line", 0))
@@ -61,9 +72,10 @@ def _collect_nodes(project_path: str) -> list[dict]:
             "id": str(nid), "name": data.get("name", ""),
             "type": tn, "file": fp,
             "signature": str(data.get("signature", ""))[:300],
+            "docstring": str(data.get("docstring", ""))[:300],
             "source": src[:2000], "source_len": len(src),
         })
-    print(f"收集到 {len(nodes)} 个函数/方法（跳过 {skipped}）")
+    print(f"收集到 {len(nodes)} 个节点（跳过 {skipped}）")
     return nodes
 
 
@@ -71,10 +83,20 @@ def _summarize_one(node: dict, model_cfg: dict) -> tuple[str, str, float]:
     """对单个节点生成摘要，返回 (node_id, summary, elapsed_sec)。"""
     from mini_agent.model import Model, ModelConfig
     model = Model(ModelConfig(**model_cfg))
-    prompt = SUMMARY_PROMPT.format(
-        signature=node.get("signature", node["name"]),
-        source=node["source"],
-    )
+    if node["type"] == "CLASS":
+        extra = ""
+        if node.get("docstring"):
+            extra = f"Docstring: {node['docstring']}"
+        prompt = CLASS_PROMPT.format(
+            name=node["name"],
+            extra=extra,
+            source=node["source"],
+        )
+    else:
+        prompt = FUNC_PROMPT.format(
+            signature=node.get("signature", node["name"]),
+            source=node["source"],
+        )
     t0 = time.perf_counter()
     raw = model.generate([{"role": "user", "content": prompt}])
     elapsed = time.perf_counter() - t0
@@ -141,10 +163,20 @@ def main():
         model = Model(ModelConfig(**model_cfg))
         for node in pending:
             t0 = time.perf_counter()
-            prompt = SUMMARY_PROMPT.format(
-                signature=node.get("signature", node["name"]),
-                source=node["source"],
-            )
+            if node["type"] == "CLASS":
+                extra = ""
+                if node.get("docstring"):
+                    extra = f"Docstring: {node['docstring']}"
+                prompt = CLASS_PROMPT.format(
+                    name=node["name"],
+                    extra=extra,
+                    source=node["source"],
+                )
+            else:
+                prompt = FUNC_PROMPT.format(
+                    signature=node.get("signature", node["name"]),
+                    source=node["source"],
+                )
             raw = model.generate([{"role": "user", "content": prompt}])
             elapsed = time.perf_counter() - t0
             summary = raw if isinstance(raw, str) else raw.get("content", str(raw))
