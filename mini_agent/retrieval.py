@@ -55,7 +55,6 @@ class RetrievalConfig:
         "docstring": 1.0,
         "decorator": 2.5,
         "summary": 5.0,
-        "source": 3.0,
     })
 
 
@@ -202,13 +201,10 @@ def _category_multiplier(
     )
 
 
-def build_entries(graph, summaries: dict[str, str] | None = None,
-                  project_path: str | None = None) -> list[_Entry]:
-    """从图中构建检索条目，可选注入离线摘要和源码片段。"""
+def build_entries(graph, summaries: dict[str, str] | None = None) -> list[_Entry]:
+    """从图中构建检索条目，可选注入离线摘要。"""
     if summaries is None:
         summaries = {}
-    from pathlib import Path as _Path
-    root = _Path(project_path).resolve() if project_path else None
     entries: list[_Entry] = []
     for node_id, data in graph.nodes(data=True):
         node_type = data.get("node_type")
@@ -244,20 +240,6 @@ def build_entries(graph, summaries: dict[str, str] | None = None,
             decorator_text,
             flags=re.IGNORECASE,
         )
-        # 读取源码片段（前 2000 字符）
-        source_text = ""
-        start_line = int(data.get("start_line", 0))
-        end_line = int(data.get("end_line", 0))
-        if file_path and start_line > 0 and root is not None:
-            sf = root / file_path
-            if sf.is_file():
-                try:
-                    lines = sf.read_text(encoding="utf-8", errors="replace").splitlines()
-                    source_text = "\n".join(
-                        lines[max(0, start_line - 1):max(start_line - 1, end_line)]
-                    )[:2000]
-                except Exception:
-                    pass
         field_values = {
             "id": str(node_id),
             "name": name,
@@ -268,7 +250,6 @@ def build_entries(graph, summaries: dict[str, str] | None = None,
             "docstring": str(data.get("docstring", "")),
             "decorator": decorator_text,
             "summary": summaries.get(str(node_id), ""),
-            "source": source_text,
         }
         entries.append(_Entry(
             id=str(node_id),
@@ -353,16 +334,14 @@ class CandidateRetriever:
 
         # ════════════════════════════════════════════════════
         # 第一层：召回 —— lexical + embedding 并行构建候选池
-        # 限制召回池大小，后续阶段只在池内操作
         # ════════════════════════════════════════════════════
         pool: dict[str, Candidate] = {}
-        _RECALL_LIMIT = max(limit * 12, 150)
 
         attempted.append("lexical")
         lexical = self._lexical_rank(query)
         if lexical:
             succeeded.append("lexical")
-            for entry, score, terms, fields in lexical[:_RECALL_LIMIT]:
+            for entry, score, terms, fields in lexical:
                 self._merge(
                     pool, entry,
                     cfg.lexical_base + score * cfg.lexical_scale,
@@ -421,10 +400,10 @@ class CandidateRetriever:
                 )
 
         # ════════════════════════════════════════════════════
-        # 第三层：细化 —— fuzzy 对池内候选做文本对齐打分
+        # 第三层：细化 —— fuzzy 对所有池内候选做文本对齐
         # ════════════════════════════════════════════════════
         attempted.append("fuzzy")
-        fuzzy = self._fuzzy_rank_for_pool(query, pool)
+        fuzzy = self._fuzzy_rank(query)
         if fuzzy:
             succeeded.append("fuzzy")
             for entry, score, terms, fields in fuzzy:
@@ -556,50 +535,6 @@ class CandidateRetriever:
 
         ranked = []
         for entry in self.entries:
-            best_score = 0.0
-            best_field = ""
-            matched_terms = set()
-            for field_name in ("name", "qualified_name", "file", "signature"):
-                field_tokens = entry.fields.get(field_name, [])
-                if not field_tokens:
-                    continue
-                field_text = " ".join(field_tokens)
-                overlap = query_terms & set(field_tokens)
-                coverage = len(overlap) / max(len(query_terms), 1)
-                similarity = SequenceMatcher(
-                    None, query_text, field_text
-                ).ratio()
-                score = max(similarity, coverage)
-                if score > best_score:
-                    best_score = score
-                    best_field = field_name
-                    matched_terms = overlap
-            if best_score >= self._config.fuzzy_min_similarity:
-                best_score *= _category_multiplier(entry, query, self._config)
-                ranked.append((
-                    entry,
-                    round(best_score, 6),
-                    sorted(matched_terms),
-                    [best_field] if best_field else [],
-                ))
-        return sorted(ranked, key=lambda item: (-item[1], item[0].id))
-
-    def _fuzzy_rank_for_pool(
-        self,
-        query: str,
-        pool: dict[str, Candidate],
-    ) -> list[tuple[_Entry, float, list[str], list[str]]]:
-        """对指定候选池做 fuzzy 文本对齐，避免全图扫描。"""
-        query_text = " ".join(tokenize(query))
-        query_terms = set(query_text.split())
-        if not query_text or not pool:
-            return []
-
-        ranked = []
-        for candidate_id in pool:
-            entry = self._by_id.get(candidate_id)
-            if entry is None:
-                continue
             best_score = 0.0
             best_field = ""
             matched_terms = set()
