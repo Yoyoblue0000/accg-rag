@@ -10,10 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mini_agent.model import Model, ModelConfig
-from mini_agent.environment import Environment, EnvConfig
-from mini_agent.agent import Agent, RunResult, MsgRecord
+from mini_agent.agent import Agent, MsgRecord, RunResult
+from mini_agent.environment import EnvConfig, Environment
 from mini_agent.graph_tool import GraphTool
+from mini_agent.model import Model, ModelConfig
 from mini_agent.multi_entity import EntityExtractor
 from mini_agent.reranker import Reranker
 from mini_agent.retrieval_metrics import (
@@ -220,20 +220,33 @@ def _is_judge_passed(judge_result: dict, threshold: float) -> bool:
 def _build_run_metadata(args) -> dict:
     """收集运行环境元数据，记录 git SHA、模型版本等。"""
     meta: dict = {"dirty": None, "model": args.model}
+    repo_root = str(Path(__file__).resolve().parent.parent)
     try:
         r = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True, text=True,
-            cwd=str(Path(__file__).resolve().parent.parent),
+            cwd=repo_root,
         )
         if r.returncode == 0:
             meta["git_sha"] = r.stdout.strip()
-        r2 = subprocess.run(
-            ["git", "diff", "--quiet"],
-            capture_output=True,
-            cwd=str(Path(__file__).resolve().parent.parent),
+
+        dirty = False
+        for check_cmd, desc in [
+            (["git", "diff", "--quiet"], "unstaged"),
+            (["git", "diff", "--cached", "--quiet"], "staged"),
+        ]:
+            result = subprocess.run(check_cmd, capture_output=True, cwd=repo_root)
+            if result.returncode != 0:
+                meta.setdefault("dirty_details", []).append(desc)
+                dirty = True
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, cwd=repo_root,
         )
-        meta["dirty"] = r2.returncode != 0
+        if untracked.stdout.strip():
+            meta.setdefault("dirty_details", []).append("untracked")
+            dirty = True
+        meta["dirty"] = dirty
     except Exception:
         meta["git_sha"] = "unknown"
 
@@ -345,14 +358,12 @@ def main():
 
     verbosity = min(args.verbose, 2)
 
-    model = None
-    if not args.retrieval_only:
-        model = Model(ModelConfig(
-            base_url=args.base_url,
-            api_key="ollama",
-            model_name=args.model,
-            quiet=True,
-        ))
+    model = Model(ModelConfig(
+        base_url=args.base_url,
+        api_key="ollama",
+        model_name=args.model,
+        quiet=True,
+    ))
     env = Environment(EnvConfig(cwd=args.project_path))
     graph_tool = GraphTool(
         args.project_path,
@@ -405,8 +416,18 @@ def main():
         try:
             existing = json.loads(out_path.read_text(encoding="utf-8"))
             for record in existing:
-                if isinstance(record, dict):
-                    artifact_records.append(record)
+                if not isinstance(record, dict):
+                    continue
+                artifact_records.append(record)
+                # 仅将成功完成的记录标记为已完成，失败的允许重新运行
+                error = record.get("error")
+                answer = record.get("agent_answer")
+                retrieval = record.get("retrieval") or {}
+                if (
+                    not error
+                    and answer is not None
+                    and retrieval.get("status") != "failed"
+                ):
                     completed_indices.add(record.get("index", -1))
         except json.JSONDecodeError:
             pass
@@ -414,6 +435,7 @@ def main():
         out_path.write_text("[]", encoding="utf-8")
 
     results_for_summary: list[tuple[int, dict, RunResult]] = []
+    current_run_indices: set[int] = set()
 
     if args.retrieval_only:
         print(graph_tool.ensure_built(), flush=True)
@@ -450,9 +472,14 @@ def main():
         try:
             result = RunResult(answer="", error="未执行")
             if args.retrieval_only:
+                entity_extractor = EntityExtractor(model)
+                entities = entity_extractor.extract(question, max_entities=4)
+                search_text = question
+                if entities:
+                    search_text = " ".join(e.query or e.name for e in entities)
                 retrieval = graph_tool.retrieve_query_candidates(
-                    question,
-                    limit=10,
+                    search_text,
+                    limit=10 if len(entities) <= 1 else 12,
                     use_embeddings=args.embedding and not args.no_embedding,
                 )
                 candidate_dicts = [
@@ -476,6 +503,7 @@ def main():
                         "prefetch_evidence_ids": [],
                         "relation_expansions": [],
                         "diagnostics": list(retrieval.diagnostics),
+                        "entities": [e.to_dict() for e in entities],
                     },
                 )
             else:
@@ -493,7 +521,6 @@ def main():
                 result = agent.run(question)
         except Exception as exc:
             result = RunResult(answer="", error=f"未捕获异常: {exc}")
-            failed_count += 1
             if verbosity >= 1:
                 print(f"[错误] QA 题目 {source_index} 异常: {exc}")
 
@@ -564,6 +591,7 @@ def main():
             "answer_judge": judge_result,
         })
         completed_indices.add(source_index)
+        current_run_indices.add(source_index)
         out_path.write_text(
             json.dumps(artifact_records, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -588,10 +616,14 @@ def main():
 
     # ── 门禁汇总 ──
     total_run = completed_count + failed_count
+    current_records = [
+        r for r in artifact_records
+        if r.get("index", -1) in current_run_indices
+    ]
     judge_scores = []
     judge_evaluable = 0
     judge_passed = 0
-    for record in artifact_records:
+    for record in current_records:
         jr = record.get("answer_judge", {})
         score = jr.get("score")
         if isinstance(score, (int, float)):
@@ -604,12 +636,13 @@ def main():
     judge_pass_rate = judge_passed / judge_evaluable if judge_evaluable > 0 else 0.0
 
     # ── 保存汇总 ──
-    retrieval_summary = aggregate_retrieval_metrics(artifact_records)
+    retrieval_summary = aggregate_retrieval_metrics(current_records)
     summary_data = {
         "run_metadata": run_meta,
         "completed": completed_count,
         "failed": failed_count,
         "total": total_run,
+        "file_total_artifacts": len(artifact_records),
         "judge_evaluable": judge_evaluable,
         "judge_mean": round(judge_mean, 3),
         "judge_pass_rate": round(judge_pass_rate, 3),
@@ -653,19 +686,23 @@ def main():
     if args.fail_on_error:
         if failed_count > 0:
             gate_reasons.append(f"{failed_count} 题失败")
-        if not args.retrieval_only and judge_model and judge_evaluable > 0:
-            if judge_passed < judge_evaluable:
-                gate_reasons.append(
-                    f"Judge 通过率 {judge_pass_rate:.1%} < 100% "
-                    f"({judge_evaluable - judge_passed} 题低于阈值 {args.judge_threshold})"
+        if not args.retrieval_only and judge_model:
+            if judge_evaluable > 0:
+                if judge_passed < judge_evaluable:
+                    gate_reasons.append(
+                        f"Judge 通过率 {judge_pass_rate:.1%} < 100% "
+                        f"({judge_evaluable - judge_passed} 题低于阈值 {args.judge_threshold})"
+                    )
+                parse_failures = sum(
+                    1 for record in current_records
+                    if record.get("answer_judge", {}).get("label") == "解析失败"
                 )
-            # judge 解析失败也算阻断
-            parse_failures = sum(
-                1 for record in artifact_records
-                if record.get("answer_judge", {}).get("label") == "解析失败"
-            )
-            if parse_failures > 0:
-                gate_reasons.append(f"{parse_failures} 题 Judge 解析失败")
+                if parse_failures > 0:
+                    gate_reasons.append(f"{parse_failures} 题 Judge 解析失败")
+            elif len(current_records) > 0:
+                gate_reasons.append(
+                    f"Judge 全部 {len(current_records)} 题解析失败，无法评估答案质量"
+                )
 
     if gate_reasons:
         print(f"\n[门禁未通过] {'; '.join(gate_reasons)}")

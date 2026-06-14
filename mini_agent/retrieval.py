@@ -326,37 +326,16 @@ class CandidateRetriever:
         embedding_attempted: bool = False,
         embedding_error: str | None = None,
     ) -> RetrievalResult:
+        """级联检索：召回层(lexical+embedding)→精确层(exact)→细化层(fuzzy)。"""
         attempted: list[str] = []
         succeeded: list[str] = []
         diagnostics: list[str] = []
-        merged: dict[str, Candidate] = {}
-
-        exact_id, exact_symbol = self._exact_matches(query)
-        attempted.extend(["exact_id", "exact_symbol"])
         cfg = self._config
-        if exact_id:
-            succeeded.append("exact_id")
-            for entry in exact_id:
-                self._merge(
-                    merged, entry, cfg.exact_id_score, "exact_id",
-                    matched_terms=[entry.id],
-                    matched_fields=["id"],
-                )
-        if exact_symbol:
-            succeeded.append("exact_symbol")
-            for entry in exact_symbol:
-                multiplier = 1.0
-                # 含 :: 的限定名说明定位更精确，额外加分
-                if "::" in entry.id:
-                    multiplier = 1.5
-                self._merge(
-                    merged,
-                    entry,
-                    cfg.exact_symbol_score * multiplier * _category_multiplier(entry, query, cfg),
-                    "exact_symbol",
-                    matched_terms=tokenize(entry.name),
-                    matched_fields=["name"],
-                )
+
+        # ════════════════════════════════════════════════════
+        # 第一层：召回 —— lexical + embedding 并行构建候选池
+        # ════════════════════════════════════════════════════
+        pool: dict[str, Candidate] = {}
 
         attempted.append("lexical")
         lexical = self._lexical_rank(query)
@@ -364,12 +343,9 @@ class CandidateRetriever:
             succeeded.append("lexical")
             for entry, score, terms, fields in lexical:
                 self._merge(
-                    merged,
-                    entry,
+                    pool, entry,
                     cfg.lexical_base + score * cfg.lexical_scale,
-                    "lexical",
-                    terms,
-                    fields,
+                    "lexical", terms, fields,
                 )
 
         if embedding_attempted:
@@ -384,33 +360,61 @@ class CandidateRetriever:
                         continue
                     score = max(0.0, float(item.get("score", 0.0)))
                     self._merge(
-                        merged,
-                        entry,
+                        pool, entry,
                         cfg.embedding_base + score * cfg.embedding_scale,
-                        "embedding",
-                        [],
-                        [],
+                        "embedding", [], [],
                     )
             else:
                 diagnostics.append("embedding 未返回候选")
 
-        if len(merged) < limit:
-            attempted.append("fuzzy")
-            fuzzy = self._fuzzy_rank(query)
-            if fuzzy:
-                succeeded.append("fuzzy")
-                for entry, score, terms, fields in fuzzy:
-                    self._merge(
-                        merged,
-                        entry,
-                        cfg.fuzzy_base + score * cfg.fuzzy_scale,
-                        "fuzzy",
-                        terms,
-                        fields,
-                    )
+        # ════════════════════════════════════════════════════
+        # 第二层：精确 —— exact_id/exact_symbol 对池内候选 boost
+        # 池外候选也加入，但只有精确分（无 lexical/embedding 支撑）
+        # ════════════════════════════════════════════════════
+        attempted.extend(["exact_id", "exact_symbol"])
+        exact_id, exact_symbol = self._exact_matches(query)
+
+        if exact_id:
+            succeeded.append("exact_id")
+            for entry in exact_id:
+                in_pool = entry.id in pool
+                self._merge(
+                    pool, entry, cfg.exact_id_score, "exact_id",
+                    matched_terms=[entry.id],
+                    matched_fields=["id"],
+                )
+                if in_pool:
+                    diagnostics.append(f"exact_id 命中并提升: {entry.id}")
+
+        if exact_symbol:
+            succeeded.append("exact_symbol")
+            for entry in exact_symbol:
+                multiplier = 1.0
+                if "::" in entry.id:
+                    multiplier = 1.5
+                bonus = cfg.exact_symbol_score * multiplier * _category_multiplier(entry, query, cfg)
+                self._merge(
+                    pool, entry, bonus, "exact_symbol",
+                    matched_terms=tokenize(entry.name),
+                    matched_fields=["name"],
+                )
+
+        # ════════════════════════════════════════════════════
+        # 第三层：细化 —— fuzzy 对所有池内候选做文本对齐
+        # ════════════════════════════════════════════════════
+        attempted.append("fuzzy")
+        fuzzy = self._fuzzy_rank(query)
+        if fuzzy:
+            succeeded.append("fuzzy")
+            for entry, score, terms, fields in fuzzy:
+                self._merge(
+                    pool, entry,
+                    cfg.fuzzy_base + score * cfg.fuzzy_scale,
+                    "fuzzy", terms, fields,
+                )
 
         candidates = sorted(
-            merged.values(),
+            pool.values(),
             key=lambda item: (
                 -item.score,
                 self._category_rank(item.file, query),

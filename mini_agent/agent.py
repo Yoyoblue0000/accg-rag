@@ -6,20 +6,22 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from .model import Model
+
+from accg.models import NodeId
+
 from .environment import Environment
-from .evidence import EvidenceItem, EvidenceLedger, DisplayLevel
+from .evidence import DisplayLevel, EvidenceItem, EvidenceLedger
+from .model import Model
+from .multi_entity import EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
+from .narrator import narrate
 from .query_plan import Anchor, QueryPlan
 from .retrieval import RetrievalResult
 from .sufficiency import (
-    FinishAction,
     ExpansionRequest,
+    FinishAction,
     GateDecision,
     SufficiencyGate,
 )
-from .multi_entity import EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
-from .narrator import narrate
-from accg.models import NodeId
 
 
 @dataclass
@@ -352,13 +354,18 @@ class Agent:
         retrieval_started_at = time.perf_counter()
 
         entities = []
-        use_multi_entity = False
-        if self._orchestrator and self.graph_tool:
+        if self._entity_extractor and self.graph_tool:
             entities = self._entity_extractor.extract(task, max_entities=4)
             query_plan.entities = [e.to_dict() for e in entities]
-            use_multi_entity = len(entities) > 1
 
-        if use_multi_entity:
+        # EntityExtractor 提取出的优化搜索词——优先使用
+        entity_search_text = task
+        if entities:
+            entity_search_text = entities[0].query or task
+            if len(entities) > 1:
+                entity_search_text = " ".join(e.query or e.name for e in entities)
+
+        if len(entities) > 1 and self._orchestrator:
             prelude_result = self._orchestrator.run(
                 entities=entities,
                 task=task,
@@ -389,9 +396,10 @@ class Agent:
                 stages_attempted=list(prelude_result.stages_attempted),
                 stages_succeeded=list(prelude_result.stages_succeeded),
                 diagnostics=list(prelude_result.diagnostics),
+                status=self._derive_multi_entity_status(prelude_result),
             )
         elif self.graph_tool:
-            prelude, candidates = self._build_single_prelude(task, query_plan)
+            prelude, candidates = self._build_single_prelude(entity_search_text, query_plan)
 
         if self._retrieval_result is not None:
             self._retrieval_result.duration_ms = (
@@ -787,6 +795,17 @@ class Agent:
             anchor.prefetch_action["interface"] = "model_exploration"
             query_plan.anchors.append(anchor)
             known_ids.add(item.node_id)
+
+    @staticmethod
+    def _derive_multi_entity_status(prelude_result) -> str:
+        """根据多实体检索结果推断状态。"""
+        if not prelude_result.candidates:
+            return "failed"
+        if prelude_result.stages_succeeded:
+            return "ok"
+        if prelude_result.stages_attempted:
+            return "fallback"
+        return "failed"
 
     def _execute_expansions(
         self,
