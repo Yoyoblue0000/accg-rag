@@ -2,9 +2,11 @@
 """QA 评估脚本 — 使用图增强 Agent 回答 sweqa_requests 问题，含发布门禁。"""
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -215,6 +217,51 @@ def _is_judge_passed(judge_result: dict, threshold: float) -> bool:
     return isinstance(score, (int, float)) and score >= threshold
 
 
+def _build_run_metadata(args) -> dict:
+    """收集运行环境元数据，记录 git SHA、模型版本等。"""
+    meta: dict = {"dirty": None, "model": args.model}
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        if r.returncode == 0:
+            meta["git_sha"] = r.stdout.strip()
+        r2 = subprocess.run(
+            ["git", "diff", "--quiet"],
+            capture_output=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        meta["dirty"] = r2.returncode != 0
+    except Exception:
+        meta["git_sha"] = "unknown"
+
+    meta["embedding_model"] = getattr(args, "embedding_model", "")
+    try:
+        from importlib.metadata import version
+        meta["accg_version"] = version("accg")
+    except Exception:
+        meta["accg_version"] = "unknown"
+
+    qa_path = Path(args.qa_path)
+    if qa_path.is_file():
+        meta["dataset_sha256"] = hashlib.sha256(
+            qa_path.read_bytes()
+        ).hexdigest()
+    else:
+        meta["dataset_sha256"] = ""
+
+    meta["config"] = {
+        "max_steps": 12,
+        "embedding": args.embedding and not args.no_embedding,
+        "reranker_model": args.reranker_model or None,
+        "judge_model": args.judge_model or None,
+        "judge_threshold": args.judge_threshold,
+    }
+    return meta
+
+
 def main():
     _qa_default = os.environ.get("QA_PATH") or os.path.expanduser("~/program/sqlfluff_qa.json")
     _proj_default = os.environ.get("PROJECT_PATH") or os.path.expanduser("~/program/sqlfluff_repo")
@@ -283,7 +330,18 @@ def main():
         action="store_true",
         help="从已有输出文件恢复，跳过已完成的题目",
     )
+    parser.add_argument(
+        "--prohibit-dirty",
+        action="store_true",
+        help="工作区有未提交修改时拒绝运行",
+    )
     args = parser.parse_args()
+
+    # ── 运行元数据与 dirty 检查 ──
+    run_meta = _build_run_metadata(args)
+    if args.prohibit_dirty and run_meta.get("dirty"):
+        print("[错误] 工作区存在未提交修改，禁止 --prohibit-dirty 模式运行", file=sys.stderr)
+        sys.exit(3)
 
     verbosity = min(args.verbose, 2)
 
@@ -548,6 +606,7 @@ def main():
     # ── 保存汇总 ──
     retrieval_summary = aggregate_retrieval_metrics(artifact_records)
     summary_data = {
+        "run_metadata": run_meta,
         "completed": completed_count,
         "failed": failed_count,
         "total": total_run,

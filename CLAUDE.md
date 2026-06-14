@@ -106,12 +106,11 @@ Agent.run(task)
 - **受控关系扩展**：最多 2 次、深度 ≤2、最低置信度 0.45，记录完整审计（source_evidence_ids）
 - **证据展示 COMPLETE 优先**：探索阶段源码先尝试完整展示（COMPLETE），预算不够再降级到 PREVIEW/SNIPPET/FOLD，避免模型看不到完整内容而重复请求
 - **模型历史压缩**：移除被拒 FINAL，旧工具结果替换为证据 ID 和查询计划摘要
-- **EmbeddingRanker 磁盘缓存**：指纹校验（含摘要文本），代码不变则直接加载 `.accg/embeddings_*.pkl`
+- **EmbeddingRanker 磁盘缓存**：指纹校验（含摘要文本），代码不变则直接加载 `.accg/embeddings_*.json`
 - **摘要向量增强**：离线 7B 模型生成函数英文一行摘要，作为 embedding 输入文本
 - **CJK 分词**：`tokenize()` 提取中文单字参与检索，中文查询不再被丢弃
 - **RetrievalConfig / GateConfig**：检索分数/权重/乘数和门控阈值集中为可配置 dataclass
 - **重复调用拦截**：最近 5 条 action 去重 + contextualize 符号去重
-- **收敛分析**：≥3 个不同 via_class 时自动附加汇聚提示
 
 ## 5 阶段级联检索
 
@@ -155,18 +154,19 @@ Agent.run(task)
 ### 同步流程
 
 ```bash
-# 打包（排除无关目录）
-tar czf /tmp/accg_sync.tar.gz \
-  --exclude='.venv' --exclude='.git' --exclude='__pycache__' \
-  --exclude='*.pyc' --exclude='.pytest_cache' --exclude='.pytest-tmp*' \
-  --exclude='.tmp' --exclude='output' --exclude='handoff' --exclude='test_repos' .
+# 正式部署：按 Git SHA 发布。确保本地工作区干净。
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && git fetch origin && git checkout <sha> && ~/.local/bin/uv pip install -e . && echo DEPLOY_OK"
 
-# 上传 + 解压 + 安装
-scp -i ~/.ssh/id_ed25519 /tmp/accg_sync.tar.gz amd-jk6kg8k@10.67.8.138:~/program/accg-rag/
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && rm -rf output handoff test_repos .pytest-tmp* .tmp 2>/dev/null; tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e . && echo SYNC_OK"
+# QA 全量（含门禁）
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
+  --project-path ~/program/test_repos/requests_repo \
+  --qa-path ~/program/test_repos/sweqa_requests.json \
+  --model qwen2.5-coder:14b-instruct --limit 20 \
+  --judge-model qwen2.5:14b --judge-threshold 0.7 \
+  --fail-on-error --prohibit-dirty"
 
 # 查看进度
-ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_p4_fixed2.json | python3 -c 'import json; d=json.load(open(\"/tmp/qa_p4_fixed2.json\")); print(len(d), \"done\")'"
+ssh amd-jk6kg8k@10.67.8.138 "cat /tmp/qa_results.json | python3 -c 'import json; d=json.load(open(\"/tmp/qa_results.json\")); print(len(d), \"done\")'"
 ```
 
 ### 常见问题

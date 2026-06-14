@@ -10,7 +10,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ```
 mini_agent/
-  agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT、收敛分析
+  agent.py        — ReAct 循环、SYSTEM_PROMPT、ANSWER_PROMPT
   model.py        — LLM 接口：流式调用 + THOUGHT/ACTION 解析 + finish_reason 捕获
   graph_tool.py   — 图查询工具：9 种 action + EmbeddingRanker（磁盘缓存）
   environment.py  — 只读文件工具：read_file / list_dir
@@ -81,11 +81,10 @@ Agent.run(task)
 - **SufficiencyGate**：按单实体、比较、调用/数据流、继承、实例化和否定结论执行确定性规则
 - **受控关系扩展**：最多 2 次、深度 ≤2、最低置信度 0.45，优先共享调用者并记录完整审计
 - **模型历史压缩**：移除被拒 FINAL，旧工具结果替换为证据 ID 和查询计划摘要
-- **EmbeddingRanker 磁盘缓存**：指纹校验，代码不变则直接从 `.accg/embeddings_*.pkl` 加载
+- **EmbeddingRanker 磁盘缓存**：指纹校验，代码不变则直接从 `.accg/embeddings_*.json` 加载
 - **on_step 回调**：每步即时输出，不等全部完成后一次性打印
 - **两阶段合成**：Agent 收集证据 → `Model.generate()` 独立合成（ANSWER_PROMPT）
 - **重复调用拦截**：最近 5 条 action 去重 + contextualize 符号去重
-- **收敛分析**：≥3 个不同 via_class 时自动附加汇聚提示
 
 ## 工具一览
 
@@ -133,16 +132,16 @@ Agent 依赖 Ollama 进行 LLM 推理和 embedding，本地 GPU 有限，所有 
 ### 同步+验证流程
 
 ```bash
-# 增量同步：打包 → 上传 → 解压 → 安装
-tar czf /tmp/accg_sync.tar.gz --exclude='.venv' --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' --exclude='.pytest_cache' .
-scp -i ~/.ssh/id_ed25519 /tmp/accg_sync.tar.gz amd-jk6kg8k@10.67.8.138:~/program/accg-rag/
-ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && tar xzf accg_sync.tar.gz && rm accg_sync.tar.gz && ~/.local/bin/uv pip install -e . && echo SYNC_OK"
+# 正式部署：按 Git SHA 发布。确保本地工作区干净。
+ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && git fetch origin && git checkout <sha> && ~/.local/bin/uv pip install -e . && echo DEPLOY_OK"
 
-# QA 全量（静默，仅输出汇总表）
+# QA 全量（含门禁，必须加 --fail-on-error --prohibit-dirty --judge-model）
 ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
   --project-path ~/program/test_repos/requests_repo \
   --qa-path ~/program/test_repos/sweqa_requests.json \
-  --model qwen2.5-coder:14b-instruct --limit 20"
+  --model qwen2.5-coder:14b-instruct --limit 20 \
+  --judge-model qwen2.5:14b --judge-threshold 0.7 \
+  --fail-on-error --prohibit-dirty"
 
 # QA 单题 + verbose（调试用）
 ssh amd-jk6kg8k@10.67.8.138 "cd ~/program/accg-rag && ~/.local/bin/uv run python scripts/run_qa.py \
