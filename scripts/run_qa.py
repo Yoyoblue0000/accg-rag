@@ -211,6 +211,103 @@ def _print_synthesis(result: RunResult, verbosity: int) -> None:
     print(result.synthesis.answer)
 
 
+def _print_trace(result: RunResult) -> None:
+    """输出全流程详细信息"""
+    print(f"\n{'━'*60}")
+    print("[全流程 Trace]")
+    print(f"{'━'*60}")
+
+    # 1. 实体提取
+    entities = result.entities or []
+    print(f"\n[1] 实体提取 ({len(entities)} 个)")
+    for i, entity in enumerate(entities, 1):
+        name = entity.get("name", "?")
+        query = entity.get("query", "?")
+        desc = entity.get("description", "")
+        hint = entity.get("type_hint", "?")
+        print(f"  {i}. {name} (type={hint})")
+        print(f"     query: {query}")
+        if desc:
+            print(f"     desc: {desc}")
+
+    # 2. 检索阶段
+    retrieval = result.retrieval
+    if retrieval:
+        print(f"\n[2] 检索阶段")
+        print(f"  状态: {retrieval.status}")
+        print(f"  尝试阶段: {', '.join(retrieval.stages_attempted)}")
+        print(f"  成功阶段: {', '.join(retrieval.stages_succeeded)}")
+        print(f"  候选数量: {len(retrieval.candidates)}")
+        if retrieval.diagnostics:
+            print(f"  诊断信息:")
+            for diag in retrieval.diagnostics:
+                print(f"    - {diag}")
+
+    # 3. 候选列表
+    if retrieval and retrieval.candidates:
+        print(f"\n[3] 候选列表 (top 10)")
+        for i, c in enumerate(retrieval.candidates[:10], 1):
+            print(f"  {i}. {c.name} ({c.type}) score={c.score:.3f}")
+            print(f"     id: {c.id}")
+            print(f"     file: {c.file}")
+            print(f"     sources: {', '.join(c.sources)}")
+
+    # 4. 锚点选择
+    query_plan = result.query_plan
+    if query_plan:
+        anchors = query_plan.get("anchors", [])
+        rejected = query_plan.get("rejected_anchors", [])
+        print(f"\n[4] 锚点选择 ({len(anchors)} 个有效, {len(rejected)} 个拒绝)")
+        for i, anchor in enumerate(anchors, 1):
+            print(f"  {i}. {anchor.get('name', '?')} ({anchor.get('type', '?')})")
+            print(f"     id: {anchor.get('id', '?')}")
+            print(f"     score: {anchor.get('score', 0):.3f}")
+            print(f"     reason: {anchor.get('selection_reason', '?')}")
+            print(f"     display_level: {anchor.get('display_level', '?')}")
+            if anchor.get('omitted_reason'):
+                print(f"     omitted_reason: {anchor.get('omitted_reason')}")
+
+        if rejected:
+            print(f"\n  拒绝的锚点:")
+            for i, rej in enumerate(rejected[:5], 1):
+                candidate = rej.get("candidate", {})
+                reason = rej.get("reason", "?")
+                print(f"  {i}. {candidate.get('name', '?')} - {reason}")
+
+    # 5. 证据账本
+    evidence = result.evidence or []
+    if evidence:
+        print(f"\n[5] 证据账本 ({len(evidence)} 条)")
+        for i, item in enumerate(evidence, 1):
+            kind = item.kind
+            node_id = item.node_id or "?"
+            file = item.file or "?"
+            print(f"  {i}. [{kind}] {node_id}")
+            if file != "?":
+                print(f"     file: {file}")
+
+    # 6. 证据充分性门控
+    if result.error and "证据不足" in result.error:
+        print(f"\n[6] 证据充分性门控: 未通过")
+        print(f"  错误: {result.error}")
+    else:
+        print(f"\n[6] 证据充分性门控: 通过")
+
+    # 7. 运行统计
+    print(f"\n[7] 运行统计")
+    print(f"  轮次: {result.rounds}")
+    print(f"  探索: {result.explorations}")
+    print(f"  答案长度: {len(result.answer) if result.answer else 0}")
+
+    # 8. 诊断信息
+    if query_plan:
+        diagnostics = query_plan.get("diagnostics", [])
+        if diagnostics:
+            print(f"\n[8] 诊断信息")
+            for diag in diagnostics:
+                print(f"  - {diag}")
+
+
 def _is_judge_passed(judge_result: dict, threshold: float) -> bool:
     """Judge 评估通过：无解析失败且分数 >= 阈值。"""
     score = judge_result.get("score")
@@ -282,6 +379,8 @@ def main():
     parser = argparse.ArgumentParser(description="QA 评估脚本，含发布门禁")
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="-v 摘要 / -vv 详细（含原始 JSON）")
+    parser.add_argument("--trace", action="store_true",
+                        help="输出全流程详细信息（实体提取、检索、锚点选择、证据、门控）")
     parser.add_argument("--limit", type=int, default=3, help="只跑前 N 条问题")
     parser.add_argument("--id", type=int, nargs="+", help="指定跑第几条问题（从 1 开始）")
     parser.add_argument("--qa-path", default=_qa_default, help="QA 数据 JSON 路径")
@@ -522,6 +621,10 @@ def main():
 
         if verbosity >= 1:
             _print_synthesis(result, verbosity)
+
+        # 输出全流程 trace
+        if args.trace:
+            _print_trace(result)
 
         expected_answer = qa.get("answer", "")
         gold = extract_provisional_gold(expected_answer)
