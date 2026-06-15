@@ -95,6 +95,10 @@ class Model:
                 },
             })
 
+        # 回退方案：如果流式响应中没有 tool_calls，尝试从 content 中解析
+        if not tool_calls and tools and content:
+            tool_calls = self._parse_tool_calls_from_content(content, tools)
+
         return {
             "role": "assistant",
             "content": content,
@@ -103,6 +107,56 @@ class Model:
             "finish_reason": finish_reason,
             "extra": {"model": self.config.model_name, "timestamp": time.time()},
         }
+
+    def _parse_tool_calls_from_content(
+        self, content: str, tools: list[dict]
+    ) -> list[dict]:
+        """从 content 中解析 tool_calls（回退方案）。
+
+        当 Ollama 流式响应不支持 tool_calls 时，
+        尝试从 content 中提取 JSON 格式的工具调用。
+        """
+        import re
+        import uuid
+
+        # 尝试从 content 中提取 JSON
+        json_match = re.search(r'\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:', content)
+        if not json_match:
+            return []
+
+        brace = content.find("{", json_match.start())
+        if brace < 0:
+            return []
+
+        # 提取完整的 JSON 对象
+        depth = 0
+        for i in range(brace, len(content)):
+            ch = content[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    json_str = content[brace:i + 1]
+                    try:
+                        parsed = json.loads(json_str)
+                        if "name" in parsed and "arguments" in parsed:
+                            # 验证工具名称是否在 tools 列表中
+                            tool_names = {t["function"]["name"] for t in tools}
+                            if parsed["name"] in tool_names:
+                                return [{
+                                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": parsed["name"],
+                                        "arguments": json.dumps(parsed["arguments"]),
+                                    },
+                                }]
+                    except json.JSONDecodeError:
+                        pass
+                    break
+
+        return []
 
     def generate(self, messages: list[dict]) -> str:
         """纯文本生成，不使用 tools，用于答案合成"""
