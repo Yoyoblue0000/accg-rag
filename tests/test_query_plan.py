@@ -313,7 +313,7 @@ def test_invalid_node_id_is_rejected_and_next_anchor_is_prefetched(tmp_path):
             )
 
     class _FinalModel:
-        def query(self, messages):
+        def query(self, messages, tools=None):
             return {
                 "content": "done",
                 "raw_content": "FINAL: done",
@@ -401,7 +401,7 @@ def test_prefetch_budget_previews_large_class_but_keeps_full_ledger(tmp_path):
         def __init__(self):
             self.first_messages = None
 
-        def query(self, messages):
+        def query(self, messages, tools=None):
             self.first_messages = json.loads(json.dumps(messages))
             return {
                 "content": "done",

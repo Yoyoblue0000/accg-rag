@@ -22,6 +22,7 @@ from .sufficiency import (
     GateDecision,
     SufficiencyGate,
 )
+from .tools_schema import TOOLS
 
 
 @dataclass
@@ -613,20 +614,18 @@ class Agent:
             self.step_count += 1
 
             self._audit_model_request(f"exploration_step_{self.step_count}", self.messages)
-            response = self.model.query(self.messages)
+            response = self.model.query(self.messages, tools=TOOLS)
 
             thought = response.get("content", "").strip()
             raw_content = response.get("raw_content", "")
 
-            # 模型完成信号检测
-            finish_action = FinishAction.from_content(raw_content)
+            # 模型完成信号检测：无 tool_calls 时判定完成
             has_tools = bool(response["tool_calls"])
-            model_done = (
-                finish_action is not None
-                or not has_tools
-            )
+            model_done = not has_tools
 
             if model_done:
+                # 尝试从 content 中提取 FINAL 草稿（兼容旧协议）
+                finish_action = FinishAction.from_content(raw_content)
                 if finish_action is not None:
                     self._latest_finish_draft = finish_action.draft
                 draft = finish_action.draft if finish_action else thought

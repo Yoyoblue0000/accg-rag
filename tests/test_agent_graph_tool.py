@@ -643,7 +643,7 @@ class _FinalModel:
     def __init__(self):
         self.last_messages = None
 
-    def query(self, messages):
+    def query(self, messages, tools=None):
         self.last_messages = messages
         return {
             "content": "FINAL: evidence collected",
@@ -883,7 +883,7 @@ class _RepeatedFinalModel:
         self.query_messages = []
         self.generate_messages = None
 
-    def query(self, messages):
+    def query(self, messages, tools=None):
         self.query_messages.append(copy.deepcopy(messages))
         return {
             "content": "证据已经足够，无需继续查询",
@@ -904,7 +904,7 @@ class _StopOnlyModel:
         self.query_messages = []
         self.generate_messages = None
 
-    def query(self, messages):
+    def query(self, messages, tools=None):
         self.query_messages.append(copy.deepcopy(messages))
         return {
             "content": "There is no caller in the bounded search scope.",
@@ -1409,7 +1409,7 @@ def test_agent_keeps_full_tool_result_while_budgeting_observation(tmp_path):
             self.query_messages = []
             self.generate_messages = []
 
-        def query(self, messages):
+        def query(self, messages, tools=None):
             self.query_messages.append(copy.deepcopy(messages))
             if len(self.query_messages) == 1:
                 return {
