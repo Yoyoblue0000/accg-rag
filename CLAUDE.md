@@ -6,32 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 基于 ACCG 代码图的 ReAct Agent，使用纯文本协议调用本地 Ollama 模型进行仓库级代码问答。依赖 [accg-core](https://github.com/Yoyoblue0000/accg-core) 提供图构建与查询能力。
 
-## 架构
-
-```
-mini_agent/
-  agent.py         — ReAct 循环、SYSTEM_PROMPT/ANSWER_PROMPT、锚点预取、扩展执行、消息压缩
-  model.py         — LLM 接口：流式调用 + THOUGHT/ACTION/FINAL 解析 + finish_reason 捕获
-  graph_tool.py    — 图查询工具：9 种 action + EmbeddingRanker（摘要向量增强 + 磁盘缓存）
-  retrieval.py     — 4 阶段加权级联检索 + 候选排序 + 锚点选择
-  sufficiency.py   — FinishAction 解析、确定性证据充分性门控、受控扩展计划、GateConfig
-  evidence.py      — 证据账本：分层展示（COMPLETE/PREVIEW/SNIPPET/FOLD）、预算控制、合成选择
-  environment.py   — 只读文件工具：read_file / list_dir
-  query_plan.py    — 查询计划与锚点数据结构
-  retrieval_metrics.py — 检索评估：临时 gold 提取、recall/MRR/NDCG、锚点 PR/type coverage
-  reranker.py      — 可选在线重排器（小模型二次排序候选人）
-scripts/
-  run_agent.py          — 单任务入口
-  run_qa.py             — QA 批量评估（支持 --id、--embedding、即时写入）
-  build_summary_index.py — 离线 7B 摘要索引构建（用于 embedding 增强）
-tests/
-  test_agent_model.py      — model 层解析测试
-  test_agent_graph_tool.py — 候选排序、锚点选择、预取、扩展、合成测试
-  test_sufficiency.py      — 门控通过/拒绝、实体过滤、否定语义测试
-  test_query_plan.py       — 锚点选择排序、验证、预取预算测试
-  test_retrieval_metrics.py — gold 提取、检索指标计算测试
-```
-
 ## 常用命令
 
 ```bash
@@ -41,7 +15,7 @@ uv venv && uv pip install -e .
 # 本地单题测试
 .venv/Scripts/python.exe scripts/run_agent.py "问题描述"
 
-# 运行全部测试（234 条）
+# 运行全部测试
 .venv/Scripts/python.exe -m pytest tests/ -v
 
 # 运行单个测试文件
@@ -61,11 +35,13 @@ ssh ... --id 1 2 7 33 42 --output /tmp/qa_p4_fixed.json
 
 | 组件 | 默认 | 覆盖参数 |
 |------|------|---------|
-| LLM | `qwen2.5-coder:14b-instruct` | `--model` / `OLLAMA_MODEL` |
+| LLM | `qwen2.5:14b` | `--model` / `OLLAMA_MODEL` |
 | Embedding | `mxbai-embed-large`（334M） | `--embedding-model` / `EMBEDDING_MODEL` |
 | 重排 | 不启用 | `--reranker-model` / `RERANKER_MODEL` |
 
 Embedding 需显式传 `--embedding` 才会启用，否则仅走确定性检索（exact_id → exact_symbol → lexical → fuzzy）。
+
+**注意**：`qwen2.5-coder` 系列不支持 function calling，请使用 `qwen2.5` 系列。
 
 ## 协议
 
@@ -146,15 +122,18 @@ Agent 检索前强制运行 `EntityExtractor`。单实体使用清洗后的 `ent
 ### GPU 模型兼容性
 
 ⚠️ **Qwen3 全系（含 MoE）在 gfx1151 上输出为空，不可用。**
+⚠️ **Qwen2.5-coder 系列不支持 function calling，请使用 qwen2.5 系列。**
 
-| 模型 | 架构 | GPU | 速度 | 备注 |
-|------|------|-----|------|------|
-| qwen2.5-coder:14b-instruct | Dense 14.8B | ✅ | 19 t/s | 当前默认 |
-| qwen2.5-coder:32b (Q4_K_M) | Dense 32.8B | ✅ | ~4.5 t/s | 高质量，慢 |
-| qwen2.5:72b | Dense 72.7B | ✅ | 4.5 t/s | 太慢，不适合批量 |
-| qwen3:30b | MoE 30.5B | ❌ | — | GPU 输出为空 |
-| mxbai-embed-large | 334M | ✅ | ~15ms | Embedding 推荐 |
-| nomic-embed-text | 137M | ✅ | 15ms | 备选 embedding |
+| 模型 | 架构 | GPU | 速度 | Function Calling | 备注 |
+|------|------|-----|------|------------------|------|
+| qwen2.5:14b | Dense 14.8B | ✅ | ~20 t/s | ✅ | **当前默认** |
+| qwen2.5:7b | Dense 7.6B | ✅ | ~30 t/s | ✅ | 轻量级 |
+| qwen2.5:72b | Dense 72.7B | ✅ | 4.5 t/s | ✅ | 太慢，不适合批量 |
+| qwen2.5-coder:14b-instruct | Dense 14.8B | ✅ | 19 t/s | ❌ | 不支持 function calling |
+| qwen2.5-coder:32b | Dense 32.8B | ✅ | ~4.5 t/s | ❌ | 不支持 function calling |
+| qwen3:30b | MoE 30.5B | ❌ | — | — | GPU 输出为空 |
+| mxbai-embed-large | 334M | ✅ | ~15ms | — | Embedding 推荐 |
+| nomic-embed-text | 137M | ✅ | 15ms | — | 备选 embedding |
 
 ### 同步流程
 
