@@ -12,7 +12,7 @@ from accg.models import NodeId
 from .environment import Environment
 from .evidence import DisplayLevel, EvidenceItem, EvidenceLedger
 from .model import Model
-from .multi_entity import EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
+from .multi_entity import Entity, EntityExtractor, MultiEntityOrchestrator, _prefetch_anchors
 from .narrator import narrate
 from .query_plan import Anchor, QueryPlan
 from .retrieval import RetrievalResult
@@ -23,6 +23,13 @@ from .sufficiency import (
     SufficiencyGate,
 )
 from .tools_schema import TOOLS
+
+# 图工具名集合，与 GraphTool._HANDLERS 的 keys 一致
+_GRAPH_TOOL_NAMES = frozenset({
+    "contextualize", "narrow_down", "extract_clues",
+    "transitive_callers", "transitive_callees", "call_paths",
+    "class_hierarchy", "module_tree", "module_structure",
+})
 
 
 @dataclass
@@ -45,6 +52,16 @@ class SynthesisRecord:
 
 
 @dataclass
+class QuestionAnalysis:
+    """问题分析结果"""
+    question: str
+    key_entities: list[str] = field(default_factory=list)  # 关键实体
+    question_type: str = "unknown"  # 单实体/比较/关系/继承
+    exploration_targets: list[dict] = field(default_factory=list)  # 探索目标列表
+    analysis_text: str = ""  # 分析文本
+
+
+@dataclass
 class RunResult:
     """Agent.run() 返回的完整运行轨迹"""
     answer: str
@@ -59,6 +76,7 @@ class RunResult:
     query_plan: dict | None = None
     entities: list[dict] = field(default_factory=list)
     finish_draft: str | None = None
+    question_analysis: QuestionAnalysis | None = None  # 问题分析结果
 
     @property
     def rounds(self) -> int:
@@ -104,27 +122,52 @@ def _collect_node_ids(result_json: str, *, path_mode: bool = False) -> list[str]
     return node_ids
 
 
+QUESTION_ANALYSIS_PROMPT = """\
+你是一个代码问题分析专家。请分析以下代码问题，提取关键信息并生成探索计划。
+
+## 问题
+
+__QUESTION__
+
+## 分析要求
+
+请分析这个问题，输出以下信息：
+
+1. **关键实体**：问题中提到的具体函数、类、方法、概念
+2. **问题类型**：单实体解释 / 多实体比较 / 关系分析 / 继承分析 / 架构分析
+3. **探索目标**：需要查找的具体符号或关系
+
+## 输出格式
+
+请输出纯 JSON，格式如下：
+{
+  "key_entities": ["entity1", "entity2"],
+  "question_type": "single|comparison|relation|inheritance|architecture",
+  "exploration_targets": [
+    {"type": "function|class|method|relation", "name": "symbol_name", "reason": "为什么需要查找这个"},
+    ...
+  ],
+  "analysis": "问题分析的简要说明"
+}
+
+注意：
+- key_entities 应该是代码中实际存在的符号名，不要编造
+- exploration_targets 应该包含所有需要查找的符号
+- 如果问题提到"standalone function"，要特别注意查找模块级别的函数
+- 如果问题提到具体的技术概念（如 StringIO），要查找相关代码
+"""
+
 SYSTEM_PROMPT = """
-你是一个代码分析 ReAct Agent。ACCG 已为当前项目构建了代码图，你可以在图结构和源码之间双向验证。用图定位"去哪读"，用源码验证"读到了什么"。
+你是一个代码分析 Agent。ACCG 已为当前项目构建了代码图，你可以在图结构和源码之间双向验证。用图定位"去哪读"，用源码验证"读到了什么"。
 
-## 可用工具
+## 工作方式
 
-你可以调用以下工具来查询代码图和文件系统：
-- contextualize: 定位符号并返回完整上下文（源码、调用关系、继承、实例化）
-- transitive_callers/transitive_callees: 查询传递调用链
-- call_paths: 查找两个符号之间的调用路径
-- class_hierarchy: 查询类继承层次
-- module_tree/module_structure: 查看模块结构
-- narrow_down: 基于线索精简候选
-- extract_clues: 从源码提取可定位符号
-- read_file: 读取文件内容
-- list_dir: 列出目录内容
+你可以调用工具来查询代码图和文件系统。每一步：
+1. 思考当前已知什么、缺什么证据、下一步查什么
+2. 调用合适的工具获取信息
+3. 当证据足够时，直接输出你的最终回答
 
-## 使用规则
-
-1. 使用工具查询代码图，获取证据
-2. 证据足够时，输出最终答案（用中文，引用证据）
-3. 如果证据不足，继续使用工具探索
+无依赖的查询可以同时调用多个工具。有依赖则分步执行。
 
 ## 节点类型与返回字段
 
@@ -133,12 +176,14 @@ contextualize 的返回字段取决于节点 type：
 ### FUNCTION / METHOD
 - source_context(源码)、signature、docstring
 - calls(调用了谁) / called_by(被谁调用)
+- 推荐工具: contextualize, transitive_callees, transitive_callers, call_paths, read_file
 - transitive_* 和 call_paths 必须用完整 ID（格式: 文件路径::类名::方法名）
 
 ### CLASS
 - source_context、docstring、methods(类中方法列表)
 - inherits(parents + children) — 继承层次
 - instantiated_by — 谁创建了该类的实例（含置信度和 via_class）
+- 推荐工具: contextualize, class_hierarchy, read_file
 - CLASS 没有 calls/called_by。查使用者用 instantiated_by 或 contextualize 类名::__init__
 - 禁止对 CLASS 调用 transitive_* / call_paths
 
@@ -172,6 +217,37 @@ __DRAFT__
 
 ## 请回答
 """
+
+
+def _analyze_question(model: Model, question: str) -> QuestionAnalysis:
+    """分析问题，提取关键信息和探索目标。"""
+    prompt = QUESTION_ANALYSIS_PROMPT.replace("__QUESTION__", question)
+    try:
+        raw = model.generate([{"role": "user", "content": prompt}])
+        # 尝试解析 JSON（支持嵌套）
+        # 找到第一个 { 和最后一个 }
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            json_str = raw[start:end + 1]
+            data = json.loads(json_str)
+            return QuestionAnalysis(
+                question=question,
+                key_entities=data.get("key_entities", []),
+                question_type=data.get("question_type", "unknown"),
+                exploration_targets=data.get("exploration_targets", []),
+                analysis_text=data.get("analysis", ""),
+            )
+    except Exception:
+        pass
+    # 回退：返回默认分析
+    return QuestionAnalysis(
+        question=question,
+        key_entities=[],
+        question_type="unknown",
+        exploration_targets=[],
+        analysis_text="问题分析失败，使用默认策略",
+    )
 
 
 def _format_gate_failure_message(
@@ -214,10 +290,8 @@ def _format_gate_failure_message(
         )
     parts.append(
         "\n## 请继续\n"
-        "如果证据仍不足，请用标准格式继续探索：\n"
-        "THOUGHT: <还需要什么证据>\n"
-        "ACTION: {\"name\": \"<工具>\", \"arguments\": {...}}\n\n"
-        "如果证据已足够，请输出: FINAL: <最终答案>"
+        "如果证据仍不足，请继续调用工具探索更多证据。\n"
+        "如果证据已足够，请直接输出你的回答。"
     )
     return "\n".join(parts)
 
@@ -356,14 +430,50 @@ class Agent:
         }
         return anchor
 
+    @staticmethod
+    def _entities_from_analysis(qa: "QuestionAnalysis") -> list[Entity]:
+        """将 QuestionAnalysis 转换为 Entity 列表，供 MultiEntityOrchestrator 使用。"""
+        entities = []
+        for name in qa.key_entities:
+            if not name or not name.strip():
+                continue
+            entities.append(Entity(
+                name=name.strip(),
+                query=name.strip(),
+                description="",
+                type_hint="CONCEPT",
+            ))
+        known = {e.name.casefold() for e in entities}
+        for target in qa.exploration_targets:
+            tname = target.get("name", "")
+            if not tname or tname.casefold() in known:
+                continue
+            entities.append(Entity(
+                name=tname,
+                query=tname,
+                description=target.get("reason", ""),
+                type_hint=target.get("type", "CONCEPT").upper(),
+            ))
+            known.add(tname.casefold())
+        return entities[:4]
+
     def _build_prelude(self, task: str, query_plan: QueryPlan) -> tuple[str, list[dict]]:
         """构建 prelude 文本和候选列表，填充 query_plan。返回 (prelude_text, candidates)。"""
         prelude = ""
         candidates = []
         retrieval_started_at = time.perf_counter()
 
+        # 优先使用问题分析结果，避免重复 LLM 调用
         entities = []
-        if self.graph_tool and self._entity_extractor:
+        qa = query_plan.question_analysis
+        if qa and qa.key_entities:
+            entities = self._entities_from_analysis(qa)
+            if entities:
+                query_plan.entities = [e.to_dict() for e in entities]
+                query_plan.diagnostics.append(
+                    f"从问题分析得到 {len(entities)} 个实体（跳过 EntityExtractor LLM 调用）"
+                )
+        if not entities and self.graph_tool and self._entity_extractor:
             entities = self._entity_extractor.extract(task, max_entities=4)
             query_plan.entities = [e.to_dict() for e in entities]
 
@@ -588,6 +698,20 @@ class Agent:
                 return RunResult(answer="", error="图工具未就绪")
 
         query_plan = QueryPlan(query=task)
+
+        # 问题分析阶段
+        question_analysis = None
+        if self.model:
+            question_analysis = _analyze_question(self.model, task)
+            query_plan.question_analysis = question_analysis
+            self._emit(MsgRecord(
+                role="system",
+                content=f"[问题分析] 类型: {question_analysis.question_type}, "
+                        f"关键实体: {', '.join(question_analysis.key_entities) or '无'}, "
+                        f"探索目标: {len(question_analysis.exploration_targets)} 个",
+                step=0,
+            ))
+
         prelude, candidates = self._build_prelude(task, query_plan)
 
         def _make_result(answer: str = "", error: str | None = None) -> RunResult:
@@ -599,6 +723,7 @@ class Agent:
                 query_plan=copy.deepcopy(self.last_query_plan),
                 entities=list(query_plan.entities),
                 finish_draft=self._latest_finish_draft or None,
+                question_analysis=question_analysis,
             )
 
         system_content = SYSTEM_PROMPT.replace("__CWD__", self.env.config.cwd).replace("__GRAPH_STATUS__", graph_status)
@@ -710,8 +835,7 @@ class Agent:
                 action_key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 ctx_name = args.get("name") or args.get("symbol") or ""
                 is_dup_ctx = (
-                    tool_name == "query_graph"
-                    and args.get("action") == "contextualize"
+                    (tool_name == "contextualize" or (tool_name == "query_graph" and args.get("action") == "contextualize"))
                     and ctx_name in contextualized_symbols
                 )
                 intercepted = (action_key in recent_actions[-5:]) or is_dup_ctx
@@ -729,9 +853,19 @@ class Agent:
                     if len(recent_actions) > 5:
                         recent_actions = recent_actions[-5:]
                     obs_raw = self._execute_tool(tool_name, args)
+
+                    # 归一化：图工具名 → ("query_graph", {"action": name, ...})
+                    # 使 EvidenceItem / _format_for_llm / _track_exploration 无需修改
+                    if tool_name in _GRAPH_TOOL_NAMES:
+                        norm_tool = "query_graph"
+                        norm_args = {"action": tool_name, **args}
+                    else:
+                        norm_tool = tool_name
+                        norm_args = args
+
                     # 创建结构化证据并写入账本
                     evidence_items = EvidenceItem.from_tool_result(
-                        tool_name, args, obs_raw, self.step_count)
+                        norm_tool, norm_args, obs_raw, self.step_count)
                     for ei in evidence_items:
                         self._ledger.add(ei)
                     self._register_dynamic_anchors(
@@ -741,17 +875,17 @@ class Agent:
                     self.last_query_plan = query_plan.to_dict()
                     obs_text = self._ledger.render_for_observation(evidence_items)
                     if not obs_text:
-                        obs_text = self._format_for_llm(obs_raw, tool_name, args)
-                    if tool_name == "query_graph" and args.get("action") == "contextualize" and ctx_name:
+                        obs_text = self._format_for_llm(obs_raw, norm_tool, norm_args)
+                    if (tool_name == "contextualize" or (tool_name == "query_graph" and args.get("action") == "contextualize")) and ctx_name:
                         contextualized_symbols.add(ctx_name)
+
+                    # 追加已探索面包屑（使用归一化参数）
+                    obs_text = self._track_exploration(norm_tool, norm_args, obs_text)
 
                 # 控制消息不进入账本，仅附加到本轮 observation。
                 raw_json = obs_text if not intercepted else ""
                 if not intercepted:
                     raw_json = obs_raw
-
-                # 追加已探索面包屑
-                obs_text = self._track_exploration(tool_name, args, obs_text) if not intercepted else obs_text
 
                 record_raw = raw_json if raw_json else None
                 self._emit(MsgRecord(
@@ -1041,7 +1175,7 @@ class Agent:
                 f"已执行关系扩展: {expansion_count} 次。"
                 "完整数据在证据账本中。"
                 "你可以继续用工具探索更多证据，"
-                "或输出 FINAL: <答案>。"
+                "或直接输出你的回答。"
             ),
         })
         # 保留被拒 FINAL 之前的最近必要轮次
@@ -1119,6 +1253,11 @@ class Agent:
                 return result
             except Exception as e:
                 return f"[错误] list_dir 失败: {e}"
+
+        elif name in _GRAPH_TOOL_NAMES:
+            if not self.graph_tool:
+                return '{"error":"图工具未初始化"}'
+            return self.graph_tool.execute_full(action=name, **args)
 
         elif name == "query_graph":
             if not self.graph_tool:

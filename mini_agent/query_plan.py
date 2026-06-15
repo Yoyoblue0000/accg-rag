@@ -62,6 +62,7 @@ class QueryPlan:
     relation_expansions: list[dict] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     rerank: dict | None = None
+    question_analysis: dict | None = None  # 问题分析结果
 
     def to_dict(self) -> dict:
         return {
@@ -77,4 +78,15 @@ class QueryPlan:
             "relation_expansions": list(self.relation_expansions),
             "diagnostics": list(self.diagnostics),
             "rerank": self.rerank,
+            "question_analysis": (
+                {
+                    "question": self.question_analysis.question,
+                    "key_entities": self.question_analysis.key_entities,
+                    "question_type": self.question_analysis.question_type,
+                    "exploration_targets": self.question_analysis.exploration_targets,
+                    "analysis_text": self.question_analysis.analysis_text,
+                }
+                if self.question_analysis is not None and hasattr(self.question_analysis, "question")
+                else self.question_analysis
+            ),
         }

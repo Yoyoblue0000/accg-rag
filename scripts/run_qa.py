@@ -217,6 +217,19 @@ def _print_trace(result: RunResult) -> None:
     print("[全流程 Trace]")
     print(f"{'━'*60}")
 
+    # 0. 问题分析
+    question_analysis = result.question_analysis
+    if question_analysis:
+        print(f"\n[0] 问题分析")
+        print(f"  类型: {question_analysis.question_type}")
+        print(f"  关键实体: {', '.join(question_analysis.key_entities) or '无'}")
+        print(f"  探索目标: {len(question_analysis.exploration_targets)} 个")
+        for i, target in enumerate(question_analysis.exploration_targets, 1):
+            print(f"    {i}. [{target.get('type', '?')}] {target.get('name', '?')}")
+            print(f"       原因: {target.get('reason', '?')}")
+        if question_analysis.analysis_text:
+            print(f"  分析: {question_analysis.analysis_text}")
+
     # 1. 实体提取
     entities = result.entities or []
     print(f"\n[1] 实体提取 ({len(entities)} 个)")
@@ -656,6 +669,19 @@ def main():
             "relation_expansions": [],
             "diagnostics": ["Agent 未返回查询计划"],
         }
+        # 确保 question_analysis 是可序列化的字典
+        if "question_analysis" in query_plan_payload:
+            qa_obj = query_plan_payload["question_analysis"]
+            if qa_obj and hasattr(qa_obj, "to_dict"):
+                query_plan_payload["question_analysis"] = qa_obj.to_dict()
+            elif qa_obj and hasattr(qa_obj, "question"):
+                query_plan_payload["question_analysis"] = {
+                    "question": qa_obj.question,
+                    "key_entities": qa_obj.key_entities,
+                    "question_type": qa_obj.question_type,
+                    "exploration_targets": qa_obj.exploration_targets,
+                    "analysis_text": qa_obj.analysis_text,
+                }
         anchor_metrics = evaluate_anchors(
             query_plan_payload["anchors"],
             gold,
@@ -663,6 +689,17 @@ def main():
         )
 
         # 每答完一题立即写入
+        # 将 question_analysis 转换为可序列化的字典
+        question_analysis_dict = None
+        if result.question_analysis:
+            question_analysis_dict = {
+                "question": result.question_analysis.question,
+                "key_entities": result.question_analysis.key_entities,
+                "question_type": result.question_analysis.question_type,
+                "exploration_targets": result.question_analysis.exploration_targets,
+                "analysis_text": result.question_analysis.analysis_text,
+            }
+
         artifact_records.append({
             "index": source_index,
             "question": question,
@@ -688,6 +725,7 @@ def main():
             ],
             "rerank": query_plan_payload.get("rerank"),
             "answer_judge": judge_result,
+            "question_analysis": question_analysis_dict,
         })
         completed_indices.add(source_index)
         current_run_indices.add(source_index)
